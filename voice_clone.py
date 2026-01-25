@@ -6,12 +6,12 @@ Uses local Qwen3-TTS models - no data sent to cloud
 """
 
 import argparse
+import logging
 import queue
 import sys
 import tempfile
 import threading
 import time
-import traceback
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +21,14 @@ import torch
 from faster_whisper import WhisperModel
 from qwen_tts import Qwen3TTSModel
 from scipy import signal
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 # Audio processing constants
 WHISPER_SAMPLE_RATE = 16000  # Whisper uses 16kHz
@@ -79,26 +87,26 @@ class VoiceCloner:
 
         # Load voice sample to get output sample rate
         voice_audio, voice_sr = sf.read(str(self.voice_sample_path))
-        print(f"Voice sample loaded: {self.voice_sample_path}")
-        print(f"Voice sample: {len(voice_audio)} samples at {voice_sr}Hz")
+        logger.info(f"Voice sample loaded: {self.voice_sample_path}")
+        logger.debug(f"Voice sample: {len(voice_audio)} samples at {voice_sr}Hz")
 
         # Initialize Whisper for STT
-        print(f"Loading Whisper model ({whisper_model_size})...")
+        logger.info(f"Loading Whisper model ({whisper_model_size})...")
         # Auto-detect compute type if not specified
         if compute_type is None:
             compute_type = "int8" if device == "cpu" else "float16"
-        print(f"Using compute type: {compute_type}")
+        logger.info(f"Using compute type: {compute_type}")
         self.whisper_model = WhisperModel(
             whisper_model_size, device=device, compute_type=compute_type
         )
         self.vad_filter = vad_filter
 
         # Initialize local Qwen3-TTS for voice cloning
-        print(f"Loading Qwen3-TTS model ({tts_model_name})...")
+        logger.info(f"Loading Qwen3-TTS model ({tts_model_name})...")
         # Don't use flash_attention_2 on CPU or if not available
         attn_impl = "sdpa" if device == "cpu" else "flash_attention_2"
         dtype = torch.float32 if device == "cpu" else torch.bfloat16
-        print(f"Using attention: {attn_impl}, dtype: {dtype}")
+        logger.info(f"Using attention: {attn_impl}, dtype: {dtype}")
         self.tts_model = Qwen3TTSModel.from_pretrained(
             tts_model_name,
             device_map=device,
@@ -107,13 +115,13 @@ class VoiceCloner:
         )
 
         # Create voice clone prompt once and reuse it
-        print("Creating voice clone prompt from sample...")
+        logger.info("Creating voice clone prompt from sample...")
         self.voice_clone_prompt = self.tts_model.create_voice_clone_prompt(
             ref_audio=str(self.voice_sample_path),
             ref_text=self.voice_sample_text,
             x_vector_only_mode=self.x_vector_only_mode,
         )
-        print("Voice clone prompt ready!")
+        logger.info("Voice clone prompt ready!")
 
         # Audio buffers
         self.input_queue = queue.Queue()
@@ -129,13 +137,14 @@ class VoiceCloner:
     def audio_callback(self, indata, frames, time_info, status):
         """Callback for audio input stream"""
         if status:
-            print(f"Audio callback status: {status}", file=sys.stderr)
+            logger.warning(f"Audio callback status: {status}")
 
         # Add audio to processing queue
         self.input_queue.put(indata.copy())
 
     def process_audio_chunk(self, audio_chunk):
         """Process a chunk of audio through STT -> TTS pipeline"""
+        tmp_input_path = None
         try:
             # Save audio chunk to temporary file for Whisper
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_input:
@@ -150,14 +159,11 @@ class VoiceCloner:
             # Combine all segments into text
             text = " ".join([segment.text for segment in segments]).strip()
 
-            # Clean up temp input file
-            Path(tmp_input_path).unlink()
-
             if not text:
-                print("No speech detected")
+                logger.debug("No speech detected")
                 return None
 
-            print(f"Transcribed: {text}")
+            logger.info(f"Transcribed: {text}")
 
             # Text-to-Speech with voice cloning (local)
             wavs, sr = self.tts_model.generate_voice_clone(
@@ -175,18 +181,20 @@ class VoiceCloner:
             # Set output sample rate on first generation
             if self.output_sample_rate is None:
                 self.output_sample_rate = sr
-                print(f"TTS output sample rate: {sr}Hz")
+                logger.info(f"TTS output sample rate: {sr}Hz")
 
             if wavs and len(wavs) > 0:
                 audio_data = wavs[0]  # Get first (and only) output
-                print(f"Generated TTS audio: {len(audio_data)} samples at {sr}Hz")
+                logger.debug(f"Generated TTS audio: {len(audio_data)} samples at {sr}Hz")
                 return audio_data, sr
 
         except Exception as e:
-            print(f"Error processing audio chunk: {e}", file=sys.stderr)
-            import traceback
+            logger.exception(f"Error processing audio chunk: {e}")
 
-            traceback.print_exc()
+        finally:
+            # Always clean up temp file
+            if tmp_input_path and Path(tmp_input_path).exists():
+                Path(tmp_input_path).unlink()
 
         return None
 
@@ -195,7 +203,7 @@ class VoiceCloner:
         audio_buffer = np.array([], dtype=np.float32)
         chunk_samples = int(self.chunk_duration * self.sample_rate)
 
-        print("Processing loop started")
+        logger.info("Processing loop started")
 
         while self.running:
             try:
@@ -221,15 +229,12 @@ class VoiceCloner:
                         self.output_queue.put((audio_data, sr))
 
             except Exception as e:
-                print(f"Error in processing loop: {e}", file=sys.stderr)
-                import traceback
-
-                traceback.print_exc()
+                logger.exception(f"Error in processing loop: {e}")
 
     def output_callback(self, outdata, frames, time_info, status):
         """Callback for audio output stream"""
         if status:
-            print(f"Output callback status: {status}", file=sys.stderr)
+            logger.warning(f"Output callback status: {status}")
 
         try:
             # Try to get audio from output queue
@@ -238,8 +243,6 @@ class VoiceCloner:
 
                 # Resample if needed
                 if self.output_sample_rate and sr != self.output_sample_rate:
-                    from scipy import signal
-
                     num_samples = int(len(audio_data) * self.output_sample_rate / sr)
                     audio_data = signal.resample(audio_data, num_samples)
 
@@ -261,7 +264,7 @@ class VoiceCloner:
                 outdata.fill(0)
 
         except Exception as e:
-            print(f"Error in output callback: {e}", file=sys.stderr)
+            logger.error(f"Error in output callback: {e}")
             outdata.fill(0)
 
     def start(self, input_device=None, output_device=None):
@@ -273,9 +276,9 @@ class VoiceCloner:
         self.processing_thread.start()
 
         # Start audio streams
-        print(f"\nStarting audio streams...")
-        print(f"Input device: {input_device or 'default'}")
-        print(f"Output device: {output_device or 'default (use virtual device)'}")
+        logger.info("Starting audio streams...")
+        logger.info(f"Input device: {input_device or 'default'}")
+        logger.info(f"Output device: {output_device or 'default (use virtual device)'}")
 
         with sd.InputStream(
             device=input_device,
@@ -289,14 +292,14 @@ class VoiceCloner:
                 samplerate=self.output_sample_rate or DEFAULT_OUTPUT_SAMPLE_RATE,
                 callback=self.output_callback,
             ):
-                print("\n🎤 Voice cloning active! Speak into your microphone.")
-                print("Press Ctrl+C to stop.\n")
+                logger.info("🎤 Voice cloning active! Speak into your microphone.")
+                logger.info("Press Ctrl+C to stop.")
 
                 try:
                     while self.running:
                         time.sleep(MAIN_LOOP_SLEEP)
                 except KeyboardInterrupt:
-                    print("\nStopping...")
+                    logger.info("Stopping...")
 
         self.stop()
 
