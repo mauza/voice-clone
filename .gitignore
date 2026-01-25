@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Models and cache
+models/
+.cache/
+*.pt
+*.pth
+*.onnx
+
+# Audio files (except examples)
+*.wav
+*.mp3
+*.flac
+*.ogg
+!example_sample.wav
+
+# Config
+config.yaml
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

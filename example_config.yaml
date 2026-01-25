@@ -1,0 +1,58 @@
+# Example Configuration for Voice Cloning Virtual Audio Device
+# Copy this to config.yaml and customize as needed
+
+# Voice sample configuration
+voice_sample:
+  # Path to the voice sample file
+  path: "/path/to/voice_sample.wav"
+  
+# Whisper (Speech-to-Text) configuration
+whisper:
+  # Model size: tiny, base, small, medium, large
+  # Larger models are more accurate but slower
+  model_size: "base"
+  
+  # Device: cuda (GPU) or cpu
+  # GPU is much faster if available
+  device: "cuda"
+  
+  # Compute type: float16, int8, float32
+  # float16 is good balance for GPU, use int8 for CPU
+  compute_type: "float16"
+  
+  # Enable Voice Activity Detection
+  # Helps filter out background noise
+  vad_filter: true
+  
+# Audio processing configuration
+audio:
+  # Duration of audio chunks to process (seconds)
+  # Lower = less latency but more API calls
+  # Higher = more latency but better quality
+  chunk_duration: 3.0
+  
+  # Input sample rate (Hz) - Whisper uses 16kHz
+  input_sample_rate: 16000
+  
+  # Output sample rate (Hz) - Qwen3-TTS outputs 24kHz
+  output_sample_rate: 24000
+  
+# Device configuration
+devices:
+  # Input device index (microphone)
+  # Use --list-devices to find your device
+  # null = use system default
+  input_device: null
+  
+  # Output device index (virtual device or speakers)
+  # Use --list-devices to find your device
+  # null = use system default
+  output_device: null
+  
+# TTS configuration
+tts:
+  # Gradio client timeout (seconds)
+  timeout: 30
+  
+  # Maximum retries for failed requests
+  max_retries: 3

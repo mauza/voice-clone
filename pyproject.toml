@@ -1,0 +1,49 @@
+[project]
+name = "voice-clone-device"
+version = "0.1.0"
+description = "Real-time voice cloning virtual audio device for conferencing apps"
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+    # Audio processing
+    "sounddevice>=0.4.6",
+    "soundfile>=0.12.1",
+    "scipy>=1.11.0",
+    
+    # Speech-to-Text
+    "faster-whisper>=0.10.0",
+    "torch>=2.0.0",
+    
+    # Text-to-Speech (Local Qwen3-TTS)
+    "qwen-tts @ git+https://github.com/QwenLM/Qwen3-TTS.git",
+    
+    # Override old dependencies from qwen-tts
+    "librosa>=0.11.0",
+    "numba>=0.60.0",
+    
+    # General
+    "numpy>=1.24.0",
+]
+
+[tool.uv.sources]
+qwen-tts = { git = "https://github.com/QwenLM/Qwen3-TTS.git" }
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]  # Line too long (handled by formatter)
+
+[tool.black]
+line-length = 100
+target-version = ["py311", "py312"]
