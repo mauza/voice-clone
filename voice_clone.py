@@ -101,8 +101,17 @@ class SimpleVoiceConverter(VoiceConverterBase):
         """Analyze reference audio for pitch characteristics"""
         try:
             import librosa
-            self.ref_pitch = librosa.pitch_tuning(self.reference_audio, sr=self.sample_rate)
-            logger.info(f"Reference pitch offset: {self.ref_pitch:.2f} cents")
+            import numpy as np
+            # Extract fundamental frequency using pyin
+            f0, voiced_flag, voiced_probs = librosa.pyin(
+                self.reference_audio,
+                fmin=librosa.note_to_hz('C2'),
+                fmax=librosa.note_to_hz('C7'),
+                sr=self.sample_rate
+            )
+            # Get median pitch of voiced segments
+            self.ref_pitch = np.nanmedian(f0[voiced_flag]) if np.any(voiced_flag) else 0
+            logger.info(f"Reference pitch: {self.ref_pitch:.2f} Hz")
         except ImportError:
             logger.warning("librosa not available, using basic pitch estimation")
             self.ref_pitch = 0
@@ -112,21 +121,15 @@ class SimpleVoiceConverter(VoiceConverterBase):
         try:
             import librosa
 
-            # Auto-detect pitch shift needed
+            # Apply pitch shifting (skip if pitch_shift is 0)
             if self.pitch_shift == 0:
-                try:
-                    input_pitch = librosa.pitch_tuning(audio_chunk, sr=self.sample_rate)
-                    pitch_diff = self.ref_pitch - input_pitch
-                    self.pitch_shift = pitch_diff / 100.0
-                except:
-                    pass
-
-            # Apply pitch shifting
-            shifted = librosa.effects.pitch_shift(
-                audio_chunk,
-                sr=self.sample_rate,
-                n_steps=self.pitch_shift
-            )
+                shifted = audio_chunk
+            else:
+                shifted = librosa.effects.pitch_shift(
+                    audio_chunk,
+                    sr=self.sample_rate,
+                    n_steps=self.pitch_shift
+                )
 
             # Apply formant shifting via time stretching
             if self.formant_shift != 1.0:
@@ -225,7 +228,8 @@ class STTTTSPipeline:
 
         # Initialize Qwen3-TTS
         logger.info(f"Loading Qwen3-TTS model ({tts_model_name})...")
-        attn_impl = "sdpa" if device == "cpu" else "flash_attention_2"
+        # Use sdpa for both CPU and GPU - works without flash-attn package
+        attn_impl = "sdpa"
         dtype = torch.float32 if device == "cpu" else torch.bfloat16
         logger.info(f"Using attention: {attn_impl}, dtype: {dtype}")
         self.tts_model = Qwen3TTSModel.from_pretrained(
@@ -355,6 +359,7 @@ class VoiceCloner:
         # Audio buffers
         self.input_queue = queue.Queue()
         self.output_queue = queue.Queue()
+        self.output_buffer = np.array([], dtype=np.float32)  # Persistent output buffer
 
         # Control flags
         self.running = False
@@ -448,7 +453,8 @@ class VoiceCloner:
             logger.warning(f"Output callback status: {status}")
 
         try:
-            if not self.output_queue.empty():
+            # Fill buffer from queue
+            while not self.output_queue.empty() and len(self.output_buffer) < frames * 2:
                 audio_data, sr = self.output_queue.get_nowait()
 
                 # Resample if needed
@@ -456,20 +462,24 @@ class VoiceCloner:
                     num_samples = int(len(audio_data) * self.output_sample_rate / sr)
                     audio_data = signal.resample(audio_data, num_samples)
 
-                # Ensure mono
+                # Ensure mono and flatten
                 if len(audio_data.shape) > 1:
                     audio_data = audio_data.mean(axis=1)
 
-                # Fill output buffer
-                if len(audio_data) >= frames:
-                    outdata[:] = audio_data[:frames].reshape(-1, 1)
-                    if len(audio_data) > frames:
-                        self.output_queue.put((audio_data[frames:], self.output_sample_rate))
-                else:
-                    outdata[:len(audio_data)] = audio_data.reshape(-1, 1)
-                    outdata[len(audio_data):] = 0
+                self.output_buffer = np.append(self.output_buffer, audio_data)
+
+            # Fill output from buffer
+            if len(self.output_buffer) >= frames:
+                outdata[:] = self.output_buffer[:frames].reshape(-1, 1)
+                self.output_buffer = self.output_buffer[frames:]
             else:
-                outdata.fill(0)
+                # Not enough buffered - output what we have and pad with zeros
+                if len(self.output_buffer) > 0:
+                    outdata[:len(self.output_buffer)] = self.output_buffer.reshape(-1, 1)
+                    outdata[len(self.output_buffer):] = 0
+                    self.output_buffer = np.array([], dtype=np.float32)
+                else:
+                    outdata.fill(0)
 
         except Exception as e:
             logger.error(f"Error in output callback: {e}")
@@ -491,16 +501,21 @@ class VoiceCloner:
         logger.info(f"Sample rate: {self.sample_rate}Hz")
         logger.info(f"Chunk duration: {self.chunk_duration}s")
 
+        # Use larger blocksize for more stable buffering
+        blocksize = int(self.sample_rate * 0.1)  # 100ms blocks
+
         with sd.InputStream(
             device=input_device,
             channels=1,
             samplerate=self.sample_rate,
+            blocksize=blocksize,
             callback=self.audio_callback,
         ):
             with sd.OutputStream(
                 device=output_device,
                 channels=1,
                 samplerate=self.output_sample_rate,
+                blocksize=blocksize,
                 callback=self.output_callback,
             ):
                 logger.info("🎤 Voice cloning active! Speak into your microphone.")
