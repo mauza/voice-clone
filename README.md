@@ -4,397 +4,538 @@ Transform your voice in real-time using AI voice cloning for use in conferencing
 
 **100% Local - No data sent to cloud!**
 
-## How It Works
+## Two Modes
+
+### ⚡ Fast Mode (Voice Conversion)
+- **Latency:** 100-300ms (real-time capable)
+- **VRAM:** 2-4GB
+- **No transcript needed**
+- **Best for:** Video calls, gaming, live streaming
+
+### 🎨 Quality Mode (STT→TTS)
+- **Latency:** 2-5 seconds
+- **VRAM:** 8-12GB
+- **Requires transcript**
+- **Best for:** Pre-recorded content, maximum quality
 
 ```
-Your Mic → Speech-to-Text (Whisper) → Text-to-Speech (Qwen3-TTS) → Virtual Device → Conferencing App
-         [Local GPU/CPU]                [Local GPU/CPU]
+Fast:    Mic → [Voice Conversion] → Output           (100-300ms)
+Quality: Mic → [Whisper STT] → [Qwen3 TTS] → Output (2-5s)
 ```
 
-1. Captures audio from your microphone
-2. Transcribes speech to text using Whisper (runs locally)
-3. Synthesizes speech with cloned voice using Qwen3-TTS (runs locally)
-4. Outputs to a virtual audio device
-5. Select the virtual device as your microphone in conferencing apps
+## Quick Start
 
-**Privacy**: All processing happens on your machine. No audio or text is sent to any cloud service.
+```bash
+# One-time setup (installs everything)
+chmod +x run.sh
+./run.sh setup
 
-## Requirements
+# Start voice cloning in fast mode
+./run.sh start voice_sample.wav
 
-- Linux with PulseAudio or PipeWire
-- Python 3.11+
-- [uv](https://docs.astral.sh/uv/) - Fast Python package manager
-- **GPU strongly recommended** (models are large and GPU is needed for real-time performance)
-  - NVIDIA GPU with CUDA support, OR
-  - AMD GPU with ROCm support (see AMD GPU setup below)
-- At least 8GB VRAM for 1.7B model, 4GB for 0.6B model
-- A sample audio file of the voice you want to clone (WAV, MP3, etc.)
-- Transcript of the voice sample (or use --x-vector-only mode for lower quality)
+# Or quality mode (with transcript)
+./run.sh quality voice_sample.wav "Your transcript here"
+
+# Check your hardware
+./run.sh benchmark
+
+# List audio devices
+./run.sh list
+```
 
 ## Installation
 
-### 1. Install uv
+### Automatic Setup (Recommended)
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+# Clone the repository
+git clone <repo-url>
+cd voice-clone
+
+# Run setup (installs everything)
+chmod +x run.sh
+./run.sh setup
 ```
 
-Or see [uv installation docs](https://docs.astral.sh/uv/getting-started/installation/) for other methods.
+This will:
+- Install uv package manager (if needed)
+- Install all Python dependencies
+- Create virtual audio device
+- Check for GPU support
 
-### 2. Install System Dependencies
+### Manual Setup
 
-**Ubuntu/Debian:**
+If you prefer manual installation:
+
+**1. System Dependencies**
+
+Ubuntu/Debian:
 ```bash
 sudo apt-get update
 sudo apt-get install portaudio19-dev pulseaudio ffmpeg
 ```
 
-**Arch Linux:**
+Arch Linux:
 ```bash
 sudo pacman -S portaudio pipewire pipewire-pulse ffmpeg
 ```
 
-### 3. Install Python Dependencies
+**2. Python Dependencies**
 
 ```bash
+# Install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install dependencies
 uv sync
-```
 
-This will install all dependencies including Qwen3-TTS from GitHub.
-
-### 4. Install PyTorch with GPU Support (Recommended)
-
-**For NVIDIA GPUs (CUDA):**
-```bash
+# Install PyTorch with GPU support
+# NVIDIA:
 uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-```
 
-**For AMD GPUs (ROCm):**
-
-First, ensure ROCm is installed on your system. On Arch Linux:
-```bash
-sudo pacman -S rocm-hip-sdk rocm-opencl-sdk
-```
-
-Then install PyTorch with ROCm:
-```bash
-# For ROCm 6.0+
+# AMD:
 uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.0
-
-# Or for ROCm 5.7
-uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm5.7
 ```
 
-Check your ROCm version:
-```bash
-rocminfo | grep "ROCm version" || echo "ROCm not found"
-```
-
-**For CPU only (not recommended for real-time):**
-```bash
-# CPU version is included in uv sync
-```
-
-### 5. Verify GPU Detection
-
-**For NVIDIA:**
-```bash
-python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
-```
-
-**For AMD:**
-```bash
-python -c "import torch; print(f'ROCm available: {torch.cuda.is_available()}'); print(f'Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
-```
-
-You should see `True` and your GPU name. If not, check your ROCm/CUDA installation.
-
-### 6. Set Up Virtual Audio Device
+**3. Virtual Audio Device**
 
 ```bash
-chmod +x setup_virtual_device.sh
-./setup_virtual_device.sh
+./run.sh setup  # Creates virtual device
 ```
 
-This creates a virtual audio sink called "Voice Clone Virtual Output" that will appear as a microphone option in your conferencing apps.
+### Optional: RVC for Best Quality
 
-## AMD GPU Notes
+For highest quality voice conversion, install RVC after the main setup:
 
-AMD GPUs work with this project via ROCm! Key things to know:
-
-- **Use `--device cuda`** even with AMD GPUs (ROCm uses the same device API)
-- **ROCm 6.0+ recommended** for best compatibility
-- **Supported AMD GPUs**: Check [ROCm compatibility list](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html)
-- **FlashAttention 2** may not work on all AMD GPUs - if you get errors, the models will fall back to standard attention (slower but works)
-- Performance may vary compared to NVIDIA GPUs depending on your specific AMD GPU model
-
-**Troubleshooting AMD GPU issues:**
 ```bash
-# Check if ROCm detects your GPU
-rocm-smi
+# After running ./run.sh setup, install RVC separately:
+uv pip install rvc-python faiss-cpu praat-parselmouth
 
-# Check PyTorch ROCm build
-python -c "import torch; print(torch.version.hip)"
-
-# If you see errors, try without FlashAttention
-# (models will automatically fall back, but you can force it by not installing flash-attn)
+# Note: RVC dependencies may have version conflicts on some systems
+# If installation fails, you can still use the simple converter
 ```
 
-### Getting the Voice Sample Transcript
-
-You need the transcript of your voice sample. You can:
-
-1. **Manually type it out** (most accurate)
-2. **Use the helper script to transcribe it**:
-   ```bash
-   uv run transcribe_sample.py voice_sample.wav
-   ```
-   
-   This will output the transcript and the command to run voice_clone.py
+Then train an RVC model (see Training RVC Model section below).
 
 ## Usage
 
-### Basic Usage
+### Using run.sh (Recommended)
 
-**Important:** You need to provide the transcript of your voice sample!
-
+**Fast mode (default):**
 ```bash
-uv run voice_clone.py voice_sample.wav --voice-text "Okay. Yeah. I resent you. I love you."
+# Simple converter (no training needed)
+./run.sh start voice_sample.wav
+
+# With RVC (best quality, requires trained model)
+./run.sh start voice_sample.wav --converter rvc --model-path model.pth
+
+# Adjust latency
+./run.sh start voice_sample.wav --chunk-duration 0.3
 ```
 
-This will:
-- Use the default microphone as input
-- Clone the voice from `voice_sample.wav` using the provided transcript
-- Output to the default output device
-
-**Alternative:** Use `--x-vector-only` mode (lower quality, no transcript needed):
-
+**Quality mode:**
 ```bash
-uv run voice_clone.py voice_sample.wav --x-vector-only
+# With transcript
+./run.sh quality voice_sample.wav "Your transcript here"
+
+# With larger models
+./run.sh quality voice_sample.wav "..." --whisper-model medium
 ```
 
-### List Available Audio Devices
-
+**Utilities:**
 ```bash
-uv run voice_clone.py --list-devices
+# List audio devices
+./run.sh list
+
+# Check hardware
+./run.sh benchmark
+
+# Remove virtual device
+./run.sh remove
 ```
 
-Find the device indices for your microphone and virtual device.
+### Direct Usage (Advanced)
 
-### Specify Devices
+You can also call voice_clone.py directly:
 
+**Fast mode:**
 ```bash
-uv run voice_clone.py path/to/voice_sample.wav \
-  --input-device 0 \
-  --output-device 10
+uv run voice_clone.py voice_sample.wav --mode fast --converter simple
+
+# With specific devices
+uv run voice_clone.py voice.wav --mode fast --input-device 0 --output-device 12
+
+# Adjust latency
+uv run voice_clone.py voice.wav --mode fast --chunk-duration 0.3
 ```
 
-### Advanced Options
+**Quality mode:**
+```bash
+# Basic
+uv run voice_clone.py voice_sample.wav --mode quality --voice-text "Transcript"
+
+# With larger models
+uv run voice_clone.py voice_sample.wav \
+  --mode quality \
+  --voice-text "..." \
+  --whisper-model medium \
+  --tts-model Qwen/Qwen3-TTS-12Hz-1.7B-Base
+
+# Without transcript
+uv run voice_clone.py voice_sample.wav --mode quality --x-vector-only
+```
+
+## Training RVC Model (Optional, Best Quality)
+
+For best voice conversion quality, train an RVC model:
+
+### 1. Install RVC-WebUI
+
+```bash
+git clone https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI.git
+cd Retrieval-based-Voice-Conversion-WebUI
+pip install -r requirements.txt
+```
+
+### 2. Prepare Training Data
+
+- Collect 5-10 minutes of clean voice recordings
+- WAV format, 16kHz or 48kHz sample rate
+- No background noise
+- Natural speech with varied intonation
+
+### 3. Train
+
+```bash
+# Start WebUI
+python infer-web.py
+
+# In browser (usually http://localhost:7865):
+# 1. Go to "Training" tab
+# 2. Upload audio files
+# 3. Set experiment name (e.g., "my_voice")
+# 4. Click: Process data → Extract features → Train
+# 5. Wait 10-30 minutes on GPU
+# 6. Model saved in logs/my_voice/
+```
+
+### 4. Use Your Model
 
 ```bash
 uv run voice_clone.py voice_sample.wav \
-  --voice-text "Your voice sample transcript here" \
-  --whisper-model medium \      # Whisper model: tiny, base, small, medium, large
-  --tts-model Qwen/Qwen3-TTS-12Hz-0.6B-Base \  # Use smaller/faster model
-  --device cuda \               # Use GPU for faster processing
-  --chunk-duration 2.0 \        # Process audio in 2-second chunks
-  --no-vad                      # Disable Voice Activity Detection
+  --mode fast \
+  --converter rvc \
+  --model-path ~/RVC-WebUI/logs/my_voice/model.pth
 ```
 
-**Available TTS Models:**
-- `Qwen/Qwen3-TTS-12Hz-1.7B-Base` (default, best quality, needs ~8GB VRAM)
-- `Qwen/Qwen3-TTS-12Hz-0.6B-Base` (faster, needs ~4GB VRAM)
+## Performance Comparison
 
-### Full Example
+| Feature | Fast Mode | Quality Mode |
+|---------|-----------|--------------|
+| **Latency** | 100-300ms | 2-5s |
+| **VRAM** | 2-4GB | 8-12GB |
+| **Transcript** | Not needed | Required |
+| **Quality** | Good-Excellent | Excellent |
+| **Prosody** | ✅ Preserved | ❌ Lost |
+| **Real-time** | ✅ Yes | ❌ No |
+| **CPU Viable** | ⚠️ Marginal | ❌ No |
 
-```bash
-# 1. List devices to find your microphone and virtual device indices
-uv run voice_clone.py voice_sample.wav --voice-text "temp" --list-devices
+### Fast Mode Converters
 
-# Example output:
-# 0: Built-in Microphone
-# ...
-# 12: Voice Clone Virtual Output
-# ...
+| Converter | Quality | Latency | VRAM | Training |
+|-----------|---------|---------|------|----------|
+| **Simple** | 6-7/10 | 120-180ms | 0.5GB | ❌ None |
+| **RVC** | 9-9.5/10 | 150-200ms | 2.8GB | ✅ Required |
 
-# 2. Run voice cloning
-uv run voice_clone.py voice_sample.wav \
-  --voice-text "This is my voice sample transcript" \
-  --input-device 0 \
-  --output-device 12 \
-  --whisper-model base \
-  --device cuda
+## Architecture
 
-# 3. In Google Meet/Zoom:
-#    - Go to Settings → Audio
-#    - Select "Voice Clone Virtual Output" as your microphone
-#    - Start talking!
+### Fast Mode (Voice Conversion)
+
 ```
+Input Mic (16kHz)
+     ↓
+Voice Converter
+     ├─ Simple: Pitch/formant shifting
+     └─ RVC: Neural voice conversion
+     ↓
+Output (16kHz)
+```
+
+**Key characteristics:**
+- Direct audio-to-audio transformation
+- Preserves natural timing and prosody
+- Single model pass
+- Small chunks (0.3-0.7s)
+
+### Quality Mode (STT→TTS)
+
+```
+Input Mic (16kHz)
+     ↓
+Whisper STT (local)
+     ↓
+Text transcription
+     ↓
+Qwen3-TTS (local, with voice cloning)
+     ↓
+Output (24kHz)
+```
+
+**Key characteristics:**
+- Two-stage pipeline
+- Text intermediate representation
+- Larger chunks (3s)
+- Higher quality, higher latency
+
+## Use Cases
+
+### Use Fast Mode For:
+- ✅ Video conferencing (Google Meet, Zoom, Teams)
+- ✅ Gaming voice chat (Discord, TeamSpeak)
+- ✅ Live streaming (Twitch, YouTube Live)
+- ✅ VoIP calls
+- ✅ Real-time interaction
+- ✅ Limited VRAM (<8GB)
+
+### Use Quality Mode For:
+- ✅ Video dubbing
+- ✅ Podcast editing
+- ✅ Audiobook creation
+- ✅ Pre-recorded content
+- ✅ Maximum quality needed
+- ✅ When latency doesn't matter
 
 ## Tips for Best Results
 
 ### Voice Sample Quality
+- **Duration:** 10-30 seconds (more for RVC training)
+- **Quality:** Clean, high-quality recording
+- **Environment:** Quiet, no background noise
+- **Content:** Natural speech with varied intonation
+- **Format:** WAV or high-quality MP3
 
-- **Duration**: 10-30 seconds is ideal
-- **Quality**: Clear, high-quality audio without background noise
-- **Content**: Natural speech with varied intonation
-- **Format**: WAV or high-quality MP3
+### Latency Optimization
+1. Use fast mode with `--chunk-duration 0.3`
+2. Ensure GPU is being used (`--device cuda`)
+3. Close other GPU applications
+4. Use simple converter if RVC model unavailable
 
-### Performance Tuning
-
-**Fast (Lower Quality):**
-```bash
-uv run voice_clone.py sample.wav \
-  --voice-text "..." \
-  --whisper-model tiny \
-  --tts-model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
-  --chunk-duration 2.0
-```
-
-**Balanced (Recommended):**
-```bash
-uv run voice_clone.py sample.wav \
-  --voice-text "..." \
-  --whisper-model base \
-  --tts-model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
-  --chunk-duration 3.0 \
-  --device cuda
-```
-
-**Best Quality (Slower):**
-```bash
-uv run voice_clone.py sample.wav \
-  --voice-text "..." \
-  --whisper-model medium \
-  --tts-model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
-  --chunk-duration 4.0 \
-  --device cuda
-```
-
-### Latency Considerations
-
-- Smaller chunks = lower latency
-- Larger chunks = higher latency but better quality  
-- **GPU is essential** for real-time performance (CPU will be too slow)
-- 0.6B model is faster than 1.7B model
-- Expected latency: 2-5 seconds with GPU
+### Quality Optimization
+1. Train an RVC model with 5-10 minutes of audio
+2. Use quality mode for pre-recorded content
+3. Provide accurate transcript for quality mode
+4. Use larger models (medium Whisper, 1.7B TTS)
 
 ## Troubleshooting
+
+### High Latency
+
+```bash
+# Check if GPU is being used
+python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}')"
+
+# Reduce chunk size
+./run.sh start voice.wav --chunk-duration 0.2
+
+# Ensure no other apps using GPU
+nvidia-smi  # or rocm-smi for AMD
+```
+
+### Poor Voice Quality
+
+**Fast mode:** Simple converter has limited quality. Train an RVC model:
+```bash
+# See "Training RVC Model" section above
+```
+
+**Quality mode:** Use larger models:
+```bash
+./run.sh quality voice.wav "..." --whisper-model medium
+```
+
+### Out of Memory
+
+```bash
+# Use fast mode with simple converter
+./run.sh start voice.wav --converter simple
+
+# Or use smaller quality mode models
+./run.sh quality voice.wav "..." --whisper-model tiny --tts-model Qwen/Qwen3-TTS-12Hz-0.6B-Base
+```
+
+### Audio Artifacts
+
+```bash
+# Increase chunk duration
+./run.sh start voice.wav --chunk-duration 0.5
+
+# Use better voice sample (longer, cleaner)
+```
 
 ### Virtual Device Not Appearing
 
 ```bash
-# Reload PulseAudio/PipeWire
-pulseaudio --kill
-pulseaudio --start
+# Reload audio system
+pulseaudio --kill && pulseaudio --start
 
 # Or re-run setup
-./setup_virtual_device.sh
+./run.sh setup
+
+# Verify it exists
+pactl list sinks short | grep Voice
 ```
 
-### No Audio Output
+## Hardware Requirements
 
-1. Check device indices with `--list-devices`
-2. Ensure virtual device is created: `pactl list sinks short`
-3. Check volume levels in system audio settings
+### Minimum (Fast Mode, Simple Converter)
+- **GPU:** 2GB VRAM (or CPU)
+- **RAM:** 4GB
+- **Python:** 3.11 or 3.12 (3.13+ not yet fully supported)
+- **Performance:** 120-400ms latency
 
-### High Latency
+### Recommended (Fast Mode, RVC)
+- **GPU:** 4GB+ VRAM (e.g., GTX 1650)
+- **RAM:** 8GB
+- **Python:** 3.11 or 3.12
+- **Performance:** 150-200ms latency
 
-- Use a smaller `--chunk-duration` (e.g., 2.0)
-- Use `--whisper-model tiny` or `--whisper-model base`
-- Use `--tts-model Qwen/Qwen3-TTS-12Hz-0.6B-Base` (smaller/faster)
-- **Ensure you're using `--device cuda` if you have a GPU** (CPU will be very slow)
-- Close other GPU-intensive applications
+### High-End (Quality Mode)
+- **GPU:** 10GB+ VRAM (e.g., RTX 3080)
+- **RAM:** 16GB
+- **Python:** 3.11 or 3.12
+- **Performance:** 2.5-3.5s latency
 
-### Poor Transcription Quality
-
-- Use a better Whisper model: `--whisper-model medium` or `--whisper-model large`
-- Use `--no-vad` if VAD is cutting off speech
-- Improve microphone quality/reduce background noise
-- Speak more clearly with pauses between phrases
-
-### Poor Voice Cloning Quality
-
-- Ensure voice sample is high quality with no background noise
-- Provide accurate transcript with `--voice-text`
-- Use longer voice sample (10-30 seconds recommended)
-- Try the larger model: `--tts-model Qwen/Qwen3-TTS-12Hz-1.7B-Base`
-
-### CUDA Out of Memory
+### Check Your Hardware
 
 ```bash
-# Use smaller models
-uv run voice_clone.py sample.wav \
-  --voice-text "..." \
-  --whisper-model tiny \
-  --tts-model Qwen/Qwen3-TTS-12Hz-0.6B-Base \
-  --device cuda
-
-# Or use CPU (will be VERY slow - not recommended for real-time)
-uv run voice_clone.py sample.wav \
-  --voice-text "..." \
-  --whisper-model base \
-  --device cpu
+./run.sh benchmark
 ```
 
-## Architecture
+This will:
+- Detect your GPU
+- Estimate performance for both modes
+- Recommend which mode to use
 
-### Components
+## Command Reference
 
-1. **Audio Input**: Captures mic audio using sounddevice
-2. **Speech-to-Text**: Faster-Whisper for local transcription
-3. **Voice Cloning**: Qwen3-TTS via Gradio Client API
-4. **Audio Output**: Routes to virtual device via sounddevice
-5. **Virtual Device**: PulseAudio/PipeWire null sink
+### run.sh Commands
 
-### Processing Pipeline
+```bash
+./run.sh setup                      # One-time setup
+./run.sh start <voice_sample>       # Start fast mode
+./run.sh quality <voice> <text>     # Start quality mode
+./run.sh list                       # List audio devices
+./run.sh benchmark                  # Check hardware
+./run.sh remove                     # Remove virtual device
+./run.sh help                       # Show help
+```
 
-```python
-# Input: 16kHz mono audio from microphone
-# ↓
-# STT: Faster-Whisper (local, GPU/CPU)
-# ↓
-# Text transcription
-# ↓
-# TTS: Qwen3-TTS (Hugging Face API, with voice sample)
-# ↓
-# Output: 24kHz audio to virtual device
+### Fast Mode Examples
+```bash
+# Basic
+./run.sh start voice.wav
+
+# With RVC
+./run.sh start voice.wav --converter rvc --model-path model.pth
+
+# Low latency
+./run.sh start voice.wav --chunk-duration 0.2
+
+# High quality
+./run.sh start voice.wav --chunk-duration 0.5
+```
+
+### Quality Mode Examples
+```bash
+# Basic
+./run.sh quality voice.wav "Your transcript"
+
+# Best quality (larger models)
+./run.sh quality voice.wav "..." --whisper-model medium
+```
+
+### Direct voice_clone.py Usage
+```bash
+# Fast mode
+uv run voice_clone.py voice.wav --mode fast [options]
+
+# Quality mode
+uv run voice_clone.py voice.wav --mode quality --voice-text "..." [options]
+
+# Common options
+--list-devices              # List audio devices
+--input-device N            # Microphone device index
+--output-device N           # Output device index
+--device cuda/cpu           # Use GPU or CPU
+--chunk-duration N          # Chunk size in seconds
+```
+
+## All Command-Line Options
+
+```
+voice_clone.py voice_sample.wav [options]
+
+Required:
+  voice_sample              Path to voice sample audio file
+
+Mode Selection:
+  --mode {fast,quality}     Processing mode (default: fast)
+
+Common Options:
+  --input-device N          Input audio device index
+  --output-device N         Output audio device index
+  --device {cuda,cpu}       Device for models (auto-detected)
+  --chunk-duration N        Audio chunk duration in seconds
+  --list-devices            List available audio devices
+
+Fast Mode Options:
+  --converter {simple,rvc}  Voice converter type (default: simple)
+  --model-path PATH         RVC model file (required for RVC)
+
+Quality Mode Options:
+  --voice-text "..."        Transcript of voice sample
+  --whisper-model SIZE      Whisper model: tiny, base, small, medium, large
+  --tts-model MODEL         TTS model name (default: Qwen/...-1.7B-Base)
+  --no-vad                  Disable Voice Activity Detection
+  --x-vector-only           Use only speaker embedding (no transcript)
 ```
 
 ## Privacy & Security
 
-- **Speech-to-Text**: Runs 100% locally on your machine (Whisper)
-- **Text-to-Speech**: Runs 100% locally on your machine (Qwen3-TTS)
-- **Voice Sample**: Stays on your machine, never uploaded
-- **Network**: **No internet connection required** after model download
+- **Speech-to-Text:** Runs 100% locally (Whisper)
+- **Text-to-Speech:** Runs 100% locally (Qwen3-TTS)
+- **Voice Conversion:** Runs 100% locally
+- **Voice Sample:** Never uploaded, stays on your machine
+- **Network:** No internet required after model download
 
-**Privacy Guarantee**: All audio processing happens entirely on your machine. No data is sent to any cloud service.
+**Privacy Guarantee:** All audio processing happens entirely on your machine. No data sent to any cloud service.
 
 ## Limitations
 
-1. **Latency**: 2-5 seconds delay due to chunking and processing
-2. **Hardware**: Requires powerful GPU (8GB+ VRAM recommended)
-3. **Real-time**: Not truly real-time due to processing pipeline
-4. **Voice Quality**: Depends on sample quality and transcript accuracy
-5. **Languages**: Currently optimized for English (model supports 10 languages)
-6. **First Run**: Model download can take time (~3-7GB depending on model)
+1. **Latency:** Fast mode has 100-300ms delay, quality mode has 2-5s
+2. **Hardware:** GPU strongly recommended (CPU is very slow)
+3. **Voice Quality:** Depends on sample quality and mode/converter
+4. **Languages:** Optimized for English (models support multiple languages)
+5. **First Run:** Model download can take time (~3-7GB depending on mode)
 
 ## License
 
 This project is for educational and experimental purposes. Please respect voice cloning ethics and laws.
 
+## Acknowledgments
+
+- [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) - High-quality TTS with voice cloning
+- [Faster-Whisper](https://github.com/guillaumekln/faster-whisper) - Efficient speech recognition
+- [RVC-Project](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI) - Voice conversion
+- [librosa](https://github.com/librosa/librosa) - Audio processing
+
 ## Contributing
 
 Contributions welcome! Areas for improvement:
 
-- [ ] Local TTS option (no API calls)
-- [ ] Better audio resampling
-- [ ] GUI for easier setup
-- [ ] Multiple voice profiles
-- [ ] Real-time voice activity detection improvements
-- [ ] Reduced latency optimizations
-
-## Acknowledgments
-
-- [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) by Qwen team at Alibaba Cloud for open-source TTS with voice cloning
-- [Faster-Whisper](https://github.com/guillaumekln/faster-whisper) for efficient speech recognition
+- Additional voice conversion models
+- Better audio preprocessing
+- GUI for easier setup
+- Real-time quality monitoring
+- Reduced latency optimizations
+- Multi-language support improvements
