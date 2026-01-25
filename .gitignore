@@ -34,6 +34,7 @@ models/
 *.flac
 *.ogg
 !example_sample.wav
+*.txt
 
 # Config
 config.yaml
