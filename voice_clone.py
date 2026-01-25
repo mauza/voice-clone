@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Voice Cloning Virtual Audio Device
-Routes microphone input through voice cloning models for use in conferencing apps
-Supports two modes: Fast (Voice Conversion) and Quality (STT→TTS)
+Routes microphone input through voice cloning (STT→TTS) for use in conferencing apps
+Converts your speech to text, then synthesizes it in the target voice
 Uses local models - no data sent to cloud
 """
 
@@ -23,175 +23,30 @@ import torchaudio
 from faster_whisper import WhisperModel
 from qwen_tts import Qwen3TTSModel
 from scipy import signal
+from silero_vad import load_silero_vad, get_speech_timestamps, collect_chunks
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%H:%M:%S'
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S"
 )
 logger = logging.getLogger(__name__)
 
 # Audio processing constants
-WHISPER_SAMPLE_RATE = 16000
-VC_SAMPLE_RATE = 16000
+SAMPLE_RATE = 16000
 DEFAULT_OUTPUT_SAMPLE_RATE = 24000
 
 # Processing parameters
-QUEUE_TIMEOUT_FAST = 0.01  # 10ms for voice conversion
-QUEUE_TIMEOUT_QUALITY = 0.1  # 100ms for STT→TTS
+QUEUE_TIMEOUT = 0.1  # 100ms for STT→TTS
 MAIN_LOOP_SLEEP = 0.01
 
 
 # ============================================================================
-# VOICE CONVERSION MODE - Fast, Low Latency
+# VOICE CLONING PIPELINE - STT→TTS
 # ============================================================================
 
-class VoiceConverterBase:
-    """Base class for voice conversion models"""
 
-    def __init__(self, voice_sample_path, device="cuda", sample_rate=16000):
-        self.voice_sample_path = Path(voice_sample_path)
-        self.device = device
-        self.sample_rate = sample_rate
-
-        if not self.voice_sample_path.exists():
-            raise FileNotFoundError(f"Voice sample not found: {voice_sample_path}")
-
-        # Load and prepare voice sample
-        logger.info(f"Loading voice sample: {self.voice_sample_path}")
-        self.reference_audio, ref_sr = sf.read(str(self.voice_sample_path))
-
-        # Resample if needed
-        if ref_sr != self.sample_rate:
-            logger.info(f"Resampling voice sample from {ref_sr}Hz to {self.sample_rate}Hz")
-            self.reference_audio = self._resample(self.reference_audio, ref_sr, self.sample_rate)
-
-        # Convert to mono if stereo
-        if len(self.reference_audio.shape) > 1:
-            self.reference_audio = self.reference_audio.mean(axis=1)
-
-        logger.info(f"Reference audio: {len(self.reference_audio)} samples at {self.sample_rate}Hz")
-
-    def _resample(self, audio, orig_sr, target_sr):
-        """Resample audio using torchaudio"""
-        audio_tensor = torch.from_numpy(audio).float()
-        if len(audio_tensor.shape) == 1:
-            audio_tensor = audio_tensor.unsqueeze(0)
-        resampled = torchaudio.transforms.Resample(orig_sr, target_sr)(audio_tensor)
-        return resampled.squeeze(0).numpy()
-
-    def convert(self, audio_chunk):
-        """Convert voice in audio chunk - to be implemented by subclasses"""
-        raise NotImplementedError
-
-
-class SimpleVoiceConverter(VoiceConverterBase):
-    """Simple voice conversion using pitch and formant shifting"""
-
-    def __init__(self, voice_sample_path, device="cuda", sample_rate=16000,
-                 pitch_shift=0, formant_shift=1.0):
-        super().__init__(voice_sample_path, device, sample_rate)
-        self.pitch_shift = pitch_shift
-        self.formant_shift = formant_shift
-        self._analyze_reference()
-        logger.info("Initialized SimpleVoiceConverter (pitch/formant shifting)")
-
-    def _analyze_reference(self):
-        """Analyze reference audio for pitch characteristics"""
-        try:
-            import librosa
-            import numpy as np
-            # Extract fundamental frequency using pyin
-            f0, voiced_flag, voiced_probs = librosa.pyin(
-                self.reference_audio,
-                fmin=librosa.note_to_hz('C2'),
-                fmax=librosa.note_to_hz('C7'),
-                sr=self.sample_rate
-            )
-            # Get median pitch of voiced segments
-            self.ref_pitch = np.nanmedian(f0[voiced_flag]) if np.any(voiced_flag) else 0
-            logger.info(f"Reference pitch: {self.ref_pitch:.2f} Hz")
-        except ImportError:
-            logger.warning("librosa not available, using basic pitch estimation")
-            self.ref_pitch = 0
-
-    def convert(self, audio_chunk):
-        """Apply pitch and formant shifting"""
-        try:
-            import librosa
-
-            # Apply pitch shifting (skip if pitch_shift is 0)
-            if self.pitch_shift == 0:
-                shifted = audio_chunk
-            else:
-                shifted = librosa.effects.pitch_shift(
-                    audio_chunk,
-                    sr=self.sample_rate,
-                    n_steps=self.pitch_shift
-                )
-
-            # Apply formant shifting via time stretching
-            if self.formant_shift != 1.0:
-                shifted = librosa.effects.time_stretch(shifted, rate=self.formant_shift)
-
-            return shifted
-
-        except ImportError:
-            logger.warning("librosa not available, voice conversion disabled")
-            return audio_chunk
-
-
-class RVCVoiceConverter(VoiceConverterBase):
-    """RVC (Retrieval-based Voice Conversion) implementation"""
-
-    def __init__(self, voice_sample_path, model_path=None, device="cuda", sample_rate=16000):
-        super().__init__(voice_sample_path, device, sample_rate)
-
-        try:
-            from rvc_infer import RVC
-
-            if model_path is None:
-                raise ValueError("RVC model path required. Use --model-path argument.")
-
-            if not Path(model_path).exists():
-                raise FileNotFoundError(f"RVC model not found: {model_path}")
-
-            logger.info(f"Loading RVC model from {model_path}")
-            self.model = RVC(
-                model_path=model_path,
-                device=device,
-                sample_rate=sample_rate
-            )
-
-            logger.info("Extracting speaker embedding from reference audio...")
-            self.speaker_embedding = self.model.get_speaker_embedding(self.reference_audio)
-            logger.info("RVC model ready!")
-
-        except ImportError:
-            raise ImportError(
-                "RVC dependencies not installed. Install with:\n"
-                "uv pip install rvc-python faiss-cpu praat-parselmouth"
-            )
-
-    def convert(self, audio_chunk):
-        """Convert voice using RVC"""
-        converted = self.model.infer(
-            audio_chunk,
-            speaker_embedding=self.speaker_embedding,
-            f0_method="rmvpe",
-            f0_up_key=0,
-            index_rate=0.5,
-        )
-        return converted
-
-
-# ============================================================================
-# STT→TTS MODE - High Quality, Higher Latency
-# ============================================================================
-
-class STTTTSPipeline:
-    """Original STT→TTS pipeline for maximum quality"""
+class VoiceCloner:
+    """Voice cloning pipeline using STT→TTS"""
 
     def __init__(
         self,
@@ -202,12 +57,22 @@ class STTTTSPipeline:
         device="cuda",
         compute_type=None,
         vad_filter=True,
+        vad_threshold=0.5,
         x_vector_only_mode=False,
+        chunk_duration=3.0,
+        max_utterance_duration=10.0,
+        silence_duration=0.8,
     ):
         self.voice_sample_path = Path(voice_sample_path)
         self.voice_sample_text = voice_sample_text
-        self.sample_rate = WHISPER_SAMPLE_RATE
+        self.sample_rate = SAMPLE_RATE
         self.x_vector_only_mode = x_vector_only_mode
+        self.chunk_duration = chunk_duration
+        self.max_utterance_duration = max_utterance_duration
+        self.silence_duration = silence_duration
+        self.device = device
+        self.vad_filter = vad_filter
+        self.vad_threshold = vad_threshold
 
         if not self.voice_sample_path.exists():
             raise FileNotFoundError(f"Voice sample not found: {voice_sample_path}")
@@ -215,6 +80,14 @@ class STTTTSPipeline:
         # Load voice sample
         voice_audio, voice_sr = sf.read(str(self.voice_sample_path))
         logger.info(f"Voice sample loaded: {self.voice_sample_path}")
+
+        # Initialize Silero VAD for better voice activity detection
+        if vad_filter:
+            logger.info("Loading Silero VAD model...")
+            self.vad_model = load_silero_vad()
+            logger.info(f"VAD threshold: {vad_threshold}")
+        else:
+            self.vad_model = None
 
         # Initialize Whisper for STT
         logger.info(f"Loading Whisper model ({whisper_model_size})...")
@@ -224,7 +97,6 @@ class STTTTSPipeline:
         self.whisper_model = WhisperModel(
             whisper_model_size, device=device, compute_type=compute_type
         )
-        self.vad_filter = vad_filter
 
         # Initialize Qwen3-TTS
         logger.info(f"Loading Qwen3-TTS model ({tts_model_name})...")
@@ -249,19 +121,55 @@ class STTTTSPipeline:
         logger.info("Voice clone prompt ready!")
 
         self.output_sample_rate = None
+        self.output_stream_sample_rate = None
 
-    def process(self, audio_chunk):
-        """Process audio through STT→TTS pipeline"""
+        # Audio buffers
+        self.input_queue = queue.Queue()
+        self.output_queue = queue.Queue()
+        self.output_buffer = np.array([], dtype=np.float32)
+
+        # Control flags
+        self.running = False
+        self.processing_thread = None
+
+        # Performance tracking
+        self.total_chunks = 0
+        self.total_processing_time = 0
+
+        # Recording
+        self.recorded_audio = []
+        self.recording_file = None
+
+    def audio_callback(self, indata, frames, time_info, status):
+        """Callback for audio input stream"""
+        if status:
+            logger.warning(f"Audio callback status: {status}")
+        self.input_queue.put(indata.copy())
+
+    def process_audio_chunk(self, audio_chunk):
+        """Process a chunk of audio through the pipeline (VAD already applied)"""
         tmp_input_path = None
         try:
+            start_time = time.time()
+
+            # Log duration of audio being processed
+            duration = len(audio_chunk) / self.sample_rate
+            logger.info(f"Processing utterance: {duration:.2f}s")
+
             # Save audio chunk to temporary file for Whisper
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_input:
                 sf.write(tmp_input.name, audio_chunk, self.sample_rate)
                 tmp_input_path = tmp_input.name
 
-            # Speech-to-Text with Whisper
+            # Speech-to-Text with Whisper (improved settings)
             segments, info = self.whisper_model.transcribe(
-                tmp_input_path, vad_filter=self.vad_filter, language="en"
+                tmp_input_path,
+                language="en",
+                beam_size=5,  # Better accuracy
+                best_of=5,  # Sample multiple times
+                temperature=0.0,  # Deterministic output
+                vad_filter=False,  # We already did VAD with Silero
+                condition_on_previous_text=True,  # Use context
             )
 
             # Combine segments
@@ -274,6 +182,7 @@ class STTTTSPipeline:
             logger.info(f"Transcribed: {text}")
 
             # Text-to-Speech with voice cloning
+            logger.info(f"Starting TTS generation for: {text}")
             wavs, sr = self.tts_model.generate_voice_clone(
                 text=text,
                 language="Auto",
@@ -292,103 +201,16 @@ class STTTTSPipeline:
 
             if wavs and len(wavs) > 0:
                 audio_data = wavs[0]
-                logger.debug(f"Generated TTS audio: {len(audio_data)} samples at {sr}Hz")
-                return audio_data, sr
+                logger.info(f"Generated TTS audio: {len(audio_data)} samples at {sr}Hz")
 
-        except Exception as e:
-            logger.exception(f"Error processing audio chunk: {e}")
+                # Record if enabled
+                if self.recording_file:
+                    self.recorded_audio.append((audio_data.copy(), sr))
 
-        finally:
-            if tmp_input_path and Path(tmp_input_path).exists():
-                Path(tmp_input_path).unlink()
-
-        return None
-
-
-# ============================================================================
-# UNIFIED VOICE CLONER
-# ============================================================================
-
-class VoiceCloner:
-    """Unified voice cloner supporting both fast (VC) and quality (STT→TTS) modes"""
-
-    def __init__(self, mode="fast", **kwargs):
-        """
-        Initialize voice cloner
-
-        Args:
-            mode: "fast" for voice conversion, "quality" for STT→TTS
-            **kwargs: Mode-specific arguments
-        """
-        self.mode = mode
-        self.chunk_duration = kwargs.get('chunk_duration', 0.5 if mode == "fast" else 3.0)
-        self.sample_rate = VC_SAMPLE_RATE if mode == "fast" else WHISPER_SAMPLE_RATE
-
-        # Initialize appropriate pipeline
-        if mode == "fast":
-            converter_type = kwargs.get('converter_type', 'simple')
-            if converter_type == 'simple':
-                self.pipeline = SimpleVoiceConverter(
-                    kwargs['voice_sample_path'],
-                    device=kwargs.get('device', 'cuda'),
-                    sample_rate=self.sample_rate
-                )
-            elif converter_type == 'rvc':
-                self.pipeline = RVCVoiceConverter(
-                    kwargs['voice_sample_path'],
-                    model_path=kwargs.get('model_path'),
-                    device=kwargs.get('device', 'cuda'),
-                    sample_rate=self.sample_rate
-                )
+                result = (audio_data, sr)
             else:
-                raise ValueError(f"Unknown converter type: {converter_type}")
-
-        elif mode == "quality":
-            self.pipeline = STTTTSPipeline(
-                voice_sample_path=kwargs['voice_sample_path'],
-                voice_sample_text=kwargs.get('voice_sample_text'),
-                whisper_model_size=kwargs.get('whisper_model_size', 'base'),
-                tts_model_name=kwargs.get('tts_model_name', 'Qwen/Qwen3-TTS-12Hz-1.7B-Base'),
-                device=kwargs.get('device', 'cuda'),
-                vad_filter=kwargs.get('vad_filter', True),
-                x_vector_only_mode=kwargs.get('x_vector_only_mode', False),
-            )
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
-
-        # Audio buffers
-        self.input_queue = queue.Queue()
-        self.output_queue = queue.Queue()
-        self.output_buffer = np.array([], dtype=np.float32)  # Persistent output buffer
-
-        # Control flags
-        self.running = False
-        self.processing_thread = None
-
-        # Performance tracking
-        self.total_chunks = 0
-        self.total_processing_time = 0
-
-        # Output sample rate
-        self.output_sample_rate = self.sample_rate
-
-    def audio_callback(self, indata, frames, time_info, status):
-        """Callback for audio input stream"""
-        if status:
-            logger.warning(f"Audio callback status: {status}")
-        self.input_queue.put(indata.copy())
-
-    def process_audio_chunk(self, audio_chunk):
-        """Process a chunk of audio through the pipeline"""
-        try:
-            start_time = time.time()
-
-            if self.mode == "fast":
-                result = self.pipeline.convert(audio_chunk)
-                if result is not None:
-                    result = (result, self.sample_rate)
-            else:  # quality mode
-                result = self.pipeline.process(audio_chunk)
+                logger.warning("TTS returned no audio data (empty or None)")
+                result = None
 
             # Track performance
             processing_time = time.time() - start_time
@@ -401,7 +223,7 @@ class VoiceCloner:
                 chunk_duration = len(audio_chunk) / self.sample_rate
                 realtime_factor = chunk_duration / avg_time if avg_time > 0 else 0
                 logger.info(
-                    f"Performance: {avg_time*1000:.1f}ms avg processing, "
+                    f"Performance: {avg_time * 1000:.1f}ms avg processing, "
                     f"{realtime_factor:.1f}x realtime"
                 )
 
@@ -409,40 +231,123 @@ class VoiceCloner:
 
         except Exception as e:
             logger.exception(f"Error processing audio chunk: {e}")
-            return None
+
+        finally:
+            if tmp_input_path and Path(tmp_input_path).exists():
+                Path(tmp_input_path).unlink()
+
+        return None
 
     def processing_loop(self):
-        """Main processing loop - runs in separate thread"""
+        """Main processing loop - uses utterance-based detection"""
         audio_buffer = np.array([], dtype=np.float32)
-        chunk_samples = int(self.chunk_duration * self.sample_rate)
-        queue_timeout = QUEUE_TIMEOUT_FAST if self.mode == "fast" else QUEUE_TIMEOUT_QUALITY
+        last_speech_end = None
+        speech_started = False
 
-        logger.info(f"Processing loop started ({self.mode} mode, {self.chunk_duration}s chunks)")
+        max_buffer_samples = int(self.max_utterance_duration * self.sample_rate)
+        silence_samples = int(self.silence_duration * self.sample_rate)
+        vad_check_interval = int(0.5 * self.sample_rate)  # Check VAD every 0.5s
+
+        logger.info(f"Processing loop started (utterance-based, max {self.max_utterance_duration}s, {self.silence_duration}s silence cutoff)")
 
         while self.running:
             try:
                 # Get audio from input queue
                 try:
-                    audio_chunk = self.input_queue.get(timeout=queue_timeout)
+                    audio_chunk = self.input_queue.get(timeout=QUEUE_TIMEOUT)
                     audio_buffer = np.append(audio_buffer, audio_chunk.flatten())
                 except queue.Empty:
+                    # Check if we have a pending utterance that timed out
+                    if len(audio_buffer) > 0 and speech_started:
+                        if last_speech_end is not None:
+                            silence_samples_accumulated = len(audio_buffer) - last_speech_end
+                            if silence_samples_accumulated >= silence_samples:
+                                # Process the utterance (speech ended)
+                                utterance = audio_buffer[:last_speech_end]
+                                audio_buffer = audio_buffer[last_speech_end:]
+                                last_speech_end = None
+                                speech_started = False
+
+                                result = self.process_audio_chunk(utterance)
+                                if result:
+                                    audio_data, sr = result
+                                    if sr != self.output_sample_rate:
+                                        self.output_sample_rate = sr
+                                    self.output_queue.put((audio_data, sr))
                     continue
 
-                # Process when we have enough audio
-                while len(audio_buffer) >= chunk_samples:
-                    chunk = audio_buffer[:chunk_samples]
-                    audio_buffer = audio_buffer[chunk_samples:]
+                # Check buffer periodically with VAD (every 0.5s of audio or when buffer is large)
+                if len(audio_buffer) >= vad_check_interval or len(audio_buffer) >= max_buffer_samples:
+                    if self.vad_model is not None:
+                        audio_tensor = torch.FloatTensor(audio_buffer)
 
-                    result = self.process_audio_chunk(chunk)
+                        speech_timestamps = get_speech_timestamps(
+                            audio_tensor,
+                            self.vad_model,
+                            threshold=self.vad_threshold,
+                            sampling_rate=self.sample_rate,
+                            min_speech_duration_ms=100,
+                            min_silence_duration_ms=int(self.silence_duration * 1000),
+                            speech_pad_ms=100,
+                        )
 
-                    if result:
-                        audio_data, sr = result
+                        if speech_timestamps:
+                            speech_started = True
+                            # Find the last speech segment end
+                            last_speech_end = speech_timestamps[-1]['end']
 
-                        # Update output sample rate if needed (for quality mode)
-                        if self.mode == "quality" and sr != self.output_sample_rate:
-                            self.output_sample_rate = sr
+                            # Check if we have enough silence after the last speech
+                            silence_after = len(audio_buffer) - last_speech_end
 
-                        self.output_queue.put((audio_data, sr))
+                            if silence_after >= silence_samples:
+                                # Complete utterance detected - process it
+                                utterance = audio_buffer[:last_speech_end]
+                                audio_buffer = audio_buffer[last_speech_end:]
+                                last_speech_end = None
+                                speech_started = False
+
+                                result = self.process_audio_chunk(utterance)
+                                if result:
+                                    audio_data, sr = result
+                                    if sr != self.output_sample_rate:
+                                        self.output_sample_rate = sr
+                                    self.output_queue.put((audio_data, sr))
+                        else:
+                            # No speech detected - clear old buffer if no speech started
+                            if not speech_started and len(audio_buffer) > max_buffer_samples:
+                                audio_buffer = audio_buffer[-silence_samples:]  # Keep only recent silence
+                    else:
+                        # No VAD - fall back to fixed chunks
+                        chunk_samples = int(self.chunk_duration * self.sample_rate)
+                        if len(audio_buffer) >= chunk_samples:
+                            chunk = audio_buffer[:chunk_samples]
+                            audio_buffer = audio_buffer[chunk_samples:]
+
+                            result = self.process_audio_chunk(chunk)
+                            if result:
+                                audio_data, sr = result
+                                if sr != self.output_sample_rate:
+                                    self.output_sample_rate = sr
+                                self.output_queue.put((audio_data, sr))
+
+                # Prevent buffer from growing too large
+                if len(audio_buffer) > max_buffer_samples:
+                    if speech_started and last_speech_end is not None:
+                        # Force process the current utterance
+                        utterance = audio_buffer[:last_speech_end]
+                        audio_buffer = audio_buffer[last_speech_end:]
+                        last_speech_end = None
+                        speech_started = False
+
+                        result = self.process_audio_chunk(utterance)
+                        if result:
+                            audio_data, sr = result
+                            if sr != self.output_sample_rate:
+                                self.output_sample_rate = sr
+                            self.output_queue.put((audio_data, sr))
+                    else:
+                        # No speech or can't determine end - just process what we have
+                        audio_buffer = audio_buffer[-silence_samples:]
 
             except Exception as e:
                 logger.exception(f"Error in processing loop: {e}")
@@ -457,9 +362,9 @@ class VoiceCloner:
             while not self.output_queue.empty() and len(self.output_buffer) < frames * 2:
                 audio_data, sr = self.output_queue.get_nowait()
 
-                # Resample if needed
-                if sr != self.output_sample_rate:
-                    num_samples = int(len(audio_data) * self.output_sample_rate / sr)
+                # Resample TTS output (usually 24000Hz) to output stream sample rate
+                if sr != self.output_stream_sample_rate:
+                    num_samples = int(len(audio_data) * self.output_stream_sample_rate / sr)
                     audio_data = signal.resample(audio_data, num_samples)
 
                 # Ensure mono and flatten
@@ -475,8 +380,8 @@ class VoiceCloner:
             else:
                 # Not enough buffered - output what we have and pad with zeros
                 if len(self.output_buffer) > 0:
-                    outdata[:len(self.output_buffer)] = self.output_buffer.reshape(-1, 1)
-                    outdata[len(self.output_buffer):] = 0
+                    outdata[: len(self.output_buffer)] = self.output_buffer.reshape(-1, 1)
+                    outdata[len(self.output_buffer) :] = 0
                     self.output_buffer = np.array([], dtype=np.float32)
                 else:
                     outdata.fill(0)
@@ -485,9 +390,26 @@ class VoiceCloner:
             logger.error(f"Error in output callback: {e}")
             outdata.fill(0)
 
-    def start(self, input_device=None, output_device=None):
+    def start(self, input_device=None, output_device=None, output_stream_sr=None):
         """Start the voice cloning pipeline"""
         self.running = True
+
+        # Set output stream sample rate
+        if output_stream_sr:
+            self.output_stream_sample_rate = output_stream_sr
+        elif output_device is not None:
+            try:
+                device_info = sd.query_devices(output_device, "output")
+                self.output_stream_sample_rate = int(device_info["default_samplerate"])
+                logger.info(f"Output device sample rate: {self.output_stream_sample_rate}Hz")
+            except:
+                self.output_stream_sample_rate = DEFAULT_OUTPUT_SAMPLE_RATE
+        else:
+            self.output_stream_sample_rate = DEFAULT_OUTPUT_SAMPLE_RATE
+
+        # TTS output sample rate (for resampling)
+        if self.output_sample_rate is None:
+            self.output_sample_rate = self.output_stream_sample_rate
 
         # Start processing thread
         self.processing_thread = threading.Thread(target=self.processing_loop)
@@ -495,10 +417,10 @@ class VoiceCloner:
 
         # Start audio streams
         logger.info("Starting audio streams...")
-        logger.info(f"Mode: {self.mode}")
         logger.info(f"Input device: {input_device or 'default'}")
         logger.info(f"Output device: {output_device or 'default'}")
         logger.info(f"Sample rate: {self.sample_rate}Hz")
+        logger.info(f"Output stream sample rate: {self.output_stream_sample_rate}Hz")
         logger.info(f"Chunk duration: {self.chunk_duration}s")
 
         # Use larger blocksize for more stable buffering
@@ -514,7 +436,7 @@ class VoiceCloner:
             with sd.OutputStream(
                 device=output_device,
                 channels=1,
-                samplerate=self.output_sample_rate,
+                samplerate=self.output_stream_sample_rate,
                 blocksize=blocksize,
                 callback=self.output_callback,
             ):
@@ -535,10 +457,54 @@ class VoiceCloner:
         if self.processing_thread:
             self.processing_thread.join()
 
+        # Save recording if enabled
+        if self.recording_file and self.recorded_audio:
+            logger.info(f"Saving recording to {self.recording_file}...")
+            # Combine all audio chunks
+            all_audio = []
+            for audio, sr in self.recorded_audio:
+                all_audio.append(audio)
+            combined = np.concatenate(all_audio)
+            sf.write(self.recording_file, combined, 24000)
+            logger.info(f"Recording saved: {len(combined)} samples")
+
 
 # ============================================================================
 # UTILITIES
 # ============================================================================
+
+
+def find_virtual_sink():
+    """Find the virtual sink for voice clone output. Returns (device_index, sample_rate) or (None, None)"""
+    try:
+        devices = sd.query_devices()
+        voice_idx = None
+        voice_sr = None
+        pulse_idx = None
+
+        for i, device in enumerate(devices):
+            name = device["name"].lower()
+            # Look for the specific "Voice" device (virtual sink in PipeWire)
+            if name == "voice" and device["max_output_channels"] > 0:
+                voice_idx = i
+                voice_sr = int(device["default_samplerate"])
+            # Find PulseAudio backend as fallback
+            if device["name"] == "pulse":
+                pulse_idx = i
+
+        # Prioritize PulseAudio backend (works with default sink routing)
+        if pulse_idx is not None:
+            logger.info(
+                f"Using PulseAudio backend (index {pulse_idx}) - outputting to default sink"
+            )
+            return pulse_idx, 48000
+        elif voice_idx is not None:
+            logger.info(f"Found virtual sink: Voice (index {voice_idx}, sr: {voice_sr}Hz)")
+            return voice_idx, voice_sr
+    except Exception as e:
+        logger.warning(f"Could not find virtual sink: {e}")
+    return None, None
+
 
 def list_audio_devices():
     """List available audio devices"""
@@ -556,32 +522,21 @@ def main():
         description="Voice Cloning Virtual Audio Device",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-MODES:
-  --mode fast     Voice conversion (100-300ms latency, 2-4GB VRAM)
-  --mode quality  STT→TTS pipeline (2-5s latency, 8-12GB VRAM)
+Voice cloning using STT→TTS pipeline (2-5s latency, 8-12GB VRAM)
 
 EXAMPLES:
-  # Fast mode (no transcript needed)
-  %(prog)s voice.wav --mode fast --converter simple
+  # With voice transcript (recommended)
+  %(prog)s voice.wav --voice-text "Your transcript"
 
-  # Fast mode with RVC (best quality)
-  %(prog)s voice.wav --mode fast --converter rvc --model-path model.pth
-
-  # Quality mode
-  %(prog)s voice.wav --mode quality --voice-text "Your transcript"
+  # With speaker embedding only (no transcript needed)
+  %(prog)s voice.wav --x-vector-only
 
   # List audio devices
   %(prog)s voice.wav --list-devices
-"""
+""",
     )
 
     parser.add_argument("voice_sample", help="Path to audio file containing voice to clone")
-    parser.add_argument(
-        "--mode",
-        default="fast",
-        choices=["fast", "quality"],
-        help="Processing mode (default: fast)"
-    )
 
     # Common options
     parser.add_argument("--input-device", type=int, help="Input audio device index")
@@ -599,35 +554,46 @@ EXAMPLES:
 
     parser.add_argument("--device", default=default_device, help="Device for models (cuda/cpu)")
 
-    # Fast mode options
-    fast_group = parser.add_argument_group('fast mode options')
-    fast_group.add_argument(
-        "--converter",
-        default="simple",
-        choices=["simple", "rvc"],
-        help="Voice converter type (default: simple)"
-    )
-    fast_group.add_argument("--model-path", help="Path to RVC model file (required for RVC)")
-
-    # Quality mode options
-    quality_group = parser.add_argument_group('quality mode options')
-    quality_group.add_argument("--voice-text", help="Transcript of voice sample")
-    quality_group.add_argument(
+    # Voice cloning options
+    parser.add_argument("--voice-text", help="Transcript of voice sample (recommended)")
+    parser.add_argument(
         "--whisper-model",
-        default="base",
+        default="small",
         choices=["tiny", "base", "small", "medium", "large"],
-        help="Whisper model size (default: base)"
+        help="Whisper model size (default: small for better accuracy)",
     )
-    quality_group.add_argument(
+    parser.add_argument(
         "--tts-model",
         default="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-        help="Qwen3-TTS model name (default: Qwen/Qwen3-TTS-12Hz-1.7B-Base)"
+        help="Qwen3-TTS model name (default: Qwen/Qwen3-TTS-12Hz-1.7B-Base)",
     )
-    quality_group.add_argument("--no-vad", action="store_true", help="Disable VAD")
-    quality_group.add_argument(
+    parser.add_argument("--no-vad", action="store_true", help="Disable VAD")
+    parser.add_argument(
+        "--vad-threshold",
+        type=float,
+        default=0.35,
+        help="VAD sensitivity (0.0-1.0, lower = more sensitive, default: 0.35)",
+    )
+    parser.add_argument(
+        "--max-utterance",
+        type=float,
+        default=10.0,
+        help="Maximum utterance duration in seconds (default: 10.0)",
+    )
+    parser.add_argument(
+        "--silence-duration",
+        type=float,
+        default=0.8,
+        help="Silence duration to detect end of sentence in seconds (default: 0.8)",
+    )
+    parser.add_argument(
         "--x-vector-only",
         action="store_true",
-        help="Use only speaker embedding (no transcript needed)"
+        help="Use only speaker embedding (no transcript needed)",
+    )
+    parser.add_argument(
+        "--record-output",
+        help="Record all TTS output to a WAV file (e.g., output.wav)",
     )
 
     args = parser.parse_args()
@@ -636,45 +602,46 @@ EXAMPLES:
         list_audio_devices()
         return
 
+    # Auto-detect virtual sink for output if not specified
+    output_device = args.output_device
+    if output_device is None:
+        virtual_sink, sink_sr = find_virtual_sink()
+        if virtual_sink is not None:
+            output_device = virtual_sink
+            logger.info(f"Auto-detected virtual sink as output device")
+        else:
+            logger.warning("Virtual sink not found. Outputting to default device.")
+            logger.info("Run './run.sh setup' to create virtual sink for use as microphone input.")
+            sink_sr = None
+
     # Verify voice sample exists
     if not Path(args.voice_sample).exists():
         print(f"Error: Voice sample not found: {args.voice_sample}", file=sys.stderr)
         sys.exit(1)
 
-    # Validate mode-specific requirements
-    if args.mode == "fast":
-        if args.converter == "rvc" and not args.model_path:
-            parser.error("--model-path required when using RVC converter")
+    # Validate requirements
+    if not args.x_vector_only and not args.voice_text:
+        parser.error("--voice-text required (unless --x-vector-only)")
 
-        # Create voice cloner
-        cloner = VoiceCloner(
-            mode="fast",
-            voice_sample_path=args.voice_sample,
-            converter_type=args.converter,
-            model_path=args.model_path,
-            device=args.device,
-            chunk_duration=args.chunk_duration or 0.5,
-        )
+    # Create voice cloner
+    cloner = VoiceCloner(
+        voice_sample_path=args.voice_sample,
+        voice_sample_text=args.voice_text,
+        whisper_model_size=args.whisper_model,
+        tts_model_name=args.tts_model,
+        device=args.device,
+        vad_filter=not args.no_vad,
+        vad_threshold=args.vad_threshold,
+        x_vector_only_mode=args.x_vector_only,
+        chunk_duration=args.chunk_duration or 3.0,
+        max_utterance_duration=args.max_utterance,
+        silence_duration=args.silence_duration,
+    )
+    cloner.recording_file = args.record_output
 
-    else:  # quality mode
-        if not args.x_vector_only and not args.voice_text:
-            parser.error("--voice-text required in quality mode (unless --x-vector-only)")
-
-        # Create voice cloner
-        cloner = VoiceCloner(
-            mode="quality",
-            voice_sample_path=args.voice_sample,
-            voice_sample_text=args.voice_text,
-            whisper_model_size=args.whisper_model,
-            tts_model_name=args.tts_model,
-            device=args.device,
-            vad_filter=not args.no_vad,
-            x_vector_only_mode=args.x_vector_only,
-            chunk_duration=args.chunk_duration or 3.0,
-        )
-
-    # Start voice cloning
-    cloner.start(input_device=args.input_device, output_device=args.output_device)
+    cloner.start(
+        input_device=args.input_device, output_device=output_device, output_stream_sr=sink_sr
+    )
 
 
 if __name__ == "__main__":

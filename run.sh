@@ -1,5 +1,5 @@
 #!/bin/bash
-# Voice Cloning Virtual Audio Device - Unified Runner
+# Voice Cloning Virtual Audio Device - Runner
 # Handles setup, virtual device creation, and running the voice cloner
 
 set -e
@@ -33,20 +33,19 @@ print_warning() {
 # Show usage
 show_help() {
     cat << 'EOF'
-Voice Cloning Virtual Audio Device - Unified Runner
+Voice Cloning Virtual Audio Device
 
 USAGE:
   ./run.sh <command> [options]
 
-COMMANDS:
-  setup                 Install dependencies and setup virtual device
-  start <voice_sample>  Start voice cloning (fast mode)
-  quality <voice_sample> <transcript>
-                        Start voice cloning (quality mode)
-  list                  List available audio devices
-  benchmark             Check hardware capabilities
-  remove                Remove virtual audio device
-  help                  Show this help
+ COMMANDS:
+   setup                 Install dependencies and setup virtual device
+   start <voice_sample>  Start voice cloning
+   list                  List available audio devices
+   mute                  Mute virtual sink (stops playing through speakers)
+   benchmark             Check hardware capabilities
+   remove                Remove virtual audio device
+   help                  Show this help
 
 SETUP:
   ./run.sh setup        # First time setup
@@ -55,34 +54,30 @@ EXAMPLES:
   # Setup (run once)
   ./run.sh setup
 
-  # Start with fast mode (default)
+  # Start with voice transcript (recommended)
+  ./run.sh start voice_sample.wav "Your transcript here"
+
+  # Start with speaker embedding only (no transcript)
   ./run.sh start voice_sample.wav
 
-  # Start with quality mode
-  ./run.sh quality voice_sample.wav "Your transcript here"
+   # List audio devices (to find the monitor source)
+   ./run.sh list
 
-  # List audio devices
-  ./run.sh list
+   # Mute virtual sink if it's playing through speakers
+   ./run.sh mute
 
-  # Check hardware
-  ./run.sh benchmark
+   # Check hardware
+   ./run.sh benchmark
 
   # Advanced usage - pass options directly
-  ./run.sh start voice_sample.wav --converter rvc --model-path model.pth
-  ./run.sh start voice_sample.wav --chunk-duration 0.3 --device cuda
+  ./run.sh start voice_sample.wav "Your transcript" --whisper-model medium
+  ./run.sh start voice_sample.wav "" --x-vector-only
 
-MODES:
-  Fast mode (default):
-    - Latency: 100-300ms
-    - VRAM: 2-4GB
-    - No transcript needed
-    - Use for: video calls, gaming, streaming
-
-  Quality mode:
-    - Latency: 2-5s
-    - VRAM: 8-12GB
-    - Requires transcript
-    - Use for: pre-recorded content, best quality
+Voice Cloning (STT→TTS):
+  - Latency: 2-5s
+  - VRAM: 8-12GB
+  - Transcript recommended (optional with --x-vector-only)
+  - Converts speech to text, then synthesizes in target voice
 
 For more info, see README.md
 EOF
@@ -168,9 +163,16 @@ do_setup() {
         echo "GPU support already installed!"
     else
         print_warning "No GPU detected or PyTorch not installed with GPU support"
-        echo ""
-        echo "To enable GPU support (STRONGLY RECOMMENDED):"
-        echo ""
+   echo ""
+   echo "Voice Cloning (STT→TTS):"
+   echo "   - Latency: 2-5s"
+   echo "   - VRAM: 8-12GB"
+   echo "   - Transcript recommended (optional with --x-vector-only)"
+   echo "   - Converts speech to text, then synthesizes in target voice"
+   echo ""
+   echo "   The output goes to a virtual sink. Use the monitor source as your"
+   echo "   microphone input in Google Meet / Zoom / Discord."
+   echo ""
         echo "  NVIDIA GPUs:"
         echo "    uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118"
         echo ""
@@ -183,24 +185,32 @@ do_setup() {
     echo ""
     print_header "Setup Complete!"
     echo ""
-    echo "Quick start:"
-    echo "  1. Get a voice sample (10-30 seconds of clear audio)"
-    echo "  2. Run: ./run.sh start your_voice_sample.wav"
-    echo "  3. In your conferencing app, select 'Voice Clone Virtual Output' as microphone"
-    echo ""
+  echo "Quick start:"
+  echo "  1. Get a voice sample (10-30 seconds of clear audio)"
+  echo "  2. Run: ./run.sh start your_voice_sample.wav \"Your transcript\""
+  echo "  3. In your conferencing app (Google Meet/Zoom), select the virtual device as your microphone"
+  echo "  4. Run './run.sh list | grep -i voice' to find the monitor device name"
+  echo ""
     echo "Examples:"
     echo "  ./run.sh list                          # List audio devices"
-    echo "  ./run.sh start voice.wav               # Start with fast mode"
-    echo "  ./run.sh quality voice.wav \"text\"      # Start with quality mode"
+    echo "  ./run.sh start voice.wav \" transcript\" # Start with transcript"
+    echo "  ./run.sh start voice.wav               # Start with --x-vector-only"
     echo "  ./run.sh benchmark                     # Check hardware"
-    echo ""
-    echo "Optional: For best quality voice conversion, install RVC:"
-    echo "  uv pip install rvc-python faiss-cpu praat-parselmouth"
-    echo "  (Then train an RVC model - see README.md for instructions)"
     echo ""
 }
 
 # Setup virtual audio device
+mute_virtual_sink() {
+    SINK_NAME="voice_clone_output"
+    
+    if pactl list sinks short 2>/dev/null | grep -q "$SINK_NAME"; then
+        pactl set-sink-mute "$SINK_NAME" true 2>/dev/null || true
+        print_success "Virtual sink muted - now use monitor source as microphone"
+    else
+        print_warning "Virtual sink not found. Run './run.sh setup' first."
+    fi
+}
+
 setup_virtual_device() {
     SINK_NAME="voice_clone_output"
     SINK_DESCRIPTION="Voice Clone Virtual Output"
@@ -209,6 +219,7 @@ setup_virtual_device() {
     if pactl list sinks short 2>/dev/null | grep -q "$SINK_NAME"; then
         print_warning "Virtual sink already exists. Recreating..."
         pactl unload-module module-null-sink 2>/dev/null || true
+        sleep 0.5
     fi
 
     # Create virtual sink
@@ -216,6 +227,10 @@ setup_virtual_device() {
         sink_name="$SINK_NAME" \
         sink_properties=device.description="$SINK_DESCRIPTION" >/dev/null 2>&1; then
         print_success "Virtual audio device created: $SINK_DESCRIPTION"
+        
+        # Mute the virtual sink so it doesn't play through speakers
+        pactl set-sink-mute "$SINK_NAME" true 2>/dev/null || true
+        print_success "Virtual sink muted (use monitor source as microphone)"
     else
         print_error "Failed to create virtual audio device"
         exit 1
@@ -234,19 +249,20 @@ remove_virtual_device() {
     fi
 }
 
-# Start voice cloning (fast mode)
-start_fast() {
+# Start voice cloning
+start_cloning() {
     VOICE_SAMPLE="$1"
-    shift
+    TRANSCRIPT="$2"
+    shift 2 || shift
 
     if [ -z "$VOICE_SAMPLE" ]; then
         print_error "Voice sample file required!"
         echo ""
-        echo "Usage: ./run.sh start <voice_sample> [options]"
+        echo "Usage: ./run.sh start <voice_sample> [transcript] [options]"
         echo ""
         echo "Example:"
-        echo "  ./run.sh start voice.wav"
-        echo "  ./run.sh start voice.wav --converter rvc --model-path model.pth"
+        echo "  ./run.sh start voice.wav \"Your transcript here\""
+        echo "  ./run.sh start voice.wav \"\" --x-vector-only"
         exit 1
     fi
 
@@ -255,51 +271,55 @@ start_fast() {
         exit 1
     fi
 
-    print_header "Starting Voice Cloning (Fast Mode)"
+    print_header "Starting Voice Cloning"
     echo "Voice sample: $VOICE_SAMPLE"
-    echo "Mode: Fast (Voice Conversion)"
-    echo "Expected latency: 100-300ms"
-    echo ""
-
-    uv run voice_clone.py "$VOICE_SAMPLE" --mode fast "$@"
-}
-
-# Start voice cloning (quality mode)
-start_quality() {
-    VOICE_SAMPLE="$1"
-    TRANSCRIPT="$2"
-    shift 2
-
-    if [ -z "$VOICE_SAMPLE" ] || [ -z "$TRANSCRIPT" ]; then
-        print_error "Voice sample and transcript required!"
-        echo ""
-        echo "Usage: ./run.sh quality <voice_sample> <transcript> [options]"
-        echo ""
-        echo "Example:"
-        echo "  ./run.sh quality voice.wav \"This is my voice sample\""
-        exit 1
+    if [ -n "$TRANSCRIPT" ]; then
+        echo "Transcript: $TRANSCRIPT"
+    else
+        echo "Using --x-vector-only (no transcript)"
     fi
-
-    if [ ! -f "$VOICE_SAMPLE" ]; then
-        print_error "Voice sample not found: $VOICE_SAMPLE"
-        exit 1
-    fi
-
-    print_header "Starting Voice Cloning (Quality Mode)"
-    echo "Voice sample: $VOICE_SAMPLE"
-    echo "Transcript: $TRANSCRIPT"
-    echo "Mode: Quality (STT→TTS)"
+    echo "Mode: STT→TTS Pipeline"
     echo "Expected latency: 2-5s"
     echo ""
 
-    uv run voice_clone.py "$VOICE_SAMPLE" --mode quality --voice-text "$TRANSCRIPT" "$@"
+    # Set voice_clone_output as default sink for audio routing
+    if pactl list sinks short | grep -q "voice_clone_output"; then
+        PREVIOUS_SINK=$(pactl get-default-sink)
+        pactl set-default-sink voice_clone_output 2>/dev/null || true
+        print_success "Set voice_clone_output as default audio sink"
+
+        # Restore previous sink on exit
+        trap "pactl set-default-sink '$PREVIOUS_SINK' 2>/dev/null || true" EXIT
+    else
+        print_warning "Virtual sink not found. Run './run.sh setup' first."
+    fi
+
+    # Build command
+    if [ -n "$TRANSCRIPT" ]; then
+        uv run voice_clone.py "$VOICE_SAMPLE" --voice-text "$TRANSCRIPT" "$@"
+    else
+        uv run voice_clone.py "$VOICE_SAMPLE" --x-vector-only "$@"
+    fi
 }
 
 # List audio devices
 list_devices() {
     print_header "Available Audio Devices"
-    uv run voice_clone.py voice_sample.wav --list-devices 2>/dev/null || \
+    uv run voice_clone.py dummy.wav --list-devices 2>/dev/null || \
         python3 -c "import sounddevice as sd; devices = sd.query_devices(); [print(f'{i}: {d[\"name\"]}') for i, d in enumerate(devices)]"
+
+    echo ""
+    if command -v pactl &> /dev/null; then
+        print_header "Virtual Device Monitor (Use as Mic Input)"
+        echo "Look for the '.monitor' source below - this is what you select as your microphone:"
+        echo ""
+        pactl list sources short | grep -i "voice_clone" && echo "" || echo "No virtual device found. Run './run.sh setup' first."
+        
+        # Show monitor details
+        if pactl list sources short | grep -qi "voice_clone"; then
+            echo "If you hear audio from your speakers, run: ./run.sh mute"
+        fi
+    fi
 }
 
 # Run benchmark
@@ -313,30 +333,6 @@ run_benchmark() {
     fi
 }
 
-# Transcribe audio file
-transcribe_file() {
-    AUDIO_FILE="$1"
-
-    if [ -z "$AUDIO_FILE" ]; then
-        print_error "Audio file required!"
-        echo ""
-        echo "Usage: ./run.sh transcribe <audio_file>"
-        exit 1
-    fi
-
-    if [ ! -f "$AUDIO_FILE" ]; then
-        print_error "Audio file not found: $AUDIO_FILE"
-        exit 1
-    fi
-
-    print_header "Transcribing Audio"
-    print_warning "Transcription feature removed. Use quality mode with --x-vector-only instead."
-    echo ""
-    echo "Or manually transcribe with Whisper:"
-    echo "  uv pip install faster-whisper"
-    echo "  python -c \"from faster_whisper import WhisperModel; m = WhisperModel('base'); segs, _ = m.transcribe('$AUDIO_FILE'); print(' '.join([s.text for s in segs]))\""
-}
-
 # Main command handling
 COMMAND="${1:-help}"
 
@@ -347,26 +343,20 @@ case "$COMMAND" in
 
     start)
         shift
-        start_fast "$@"
-        ;;
-
-    quality)
-        shift
-        start_quality "$@"
+        start_cloning "$@"
         ;;
 
     list)
         list_devices
         ;;
 
+    mute)
+        mute_virtual_sink
+        ;;
+
     benchmark)
         shift
         run_benchmark "$@"
-        ;;
-
-    transcribe)
-        shift
-        transcribe_file "$@"
         ;;
 
     remove)

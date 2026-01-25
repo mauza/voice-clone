@@ -15,6 +15,7 @@ dependencies = [
     # Speech-to-Text (for quality mode)
     "faster-whisper>=0.10.0",
     "torch>=2.0.0",
+    "silero-vad>=5.1",
 
     # Text-to-Speech (Local Qwen3-TTS - for quality mode)
     "qwen-tts @ git+https://github.com/QwenLM/Qwen3-TTS.git",
