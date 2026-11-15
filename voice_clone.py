@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -22,7 +23,6 @@ import torch
 import torchaudio
 from faster_whisper import WhisperModel
 from qwen_tts import Qwen3TTSModel
-from scipy import signal
 from silero_vad import load_silero_vad, get_speech_timestamps, collect_chunks
 
 # Configure logging
@@ -38,6 +38,71 @@ DEFAULT_OUTPUT_SAMPLE_RATE = 24000
 # Processing parameters
 QUEUE_TIMEOUT = 0.1  # 100ms for STT→TTS
 MAIN_LOOP_SLEEP = 0.01
+
+# Audio normalization constants
+NORMALIZATION_HEADROOM = 0.95  # Prevent clipping with small headroom
+SOFT_CLIP_THRESHOLD = 0.9  # Start soft clipping at 90%
+
+
+def normalize_audio(audio_data, target_peak=NORMALIZATION_HEADROOM):
+    """Normalize audio to prevent clipping with headroom"""
+    max_val = np.abs(audio_data).max()
+    if max_val > 0:
+        return audio_data * (target_peak / max_val)
+    return audio_data
+
+
+def soft_clip(audio_data, threshold=SOFT_CLIP_THRESHOLD):
+    """Apply soft clipping using tanh for smoother limiting"""
+    # Scale to threshold range
+    scaled = audio_data / threshold
+    # Apply tanh (smooth saturation)
+    clipped = np.tanh(scaled) * threshold
+    return clipped
+
+
+def fast_resample(audio_data, orig_sr, target_sr):
+    """Fast resampling using torchaudio - preserves pitch correctly"""
+    if orig_sr == target_sr:
+        return audio_data
+
+    # Convert to torch tensor (ensure float32 for consistent processing)
+    audio_tensor = torch.from_numpy(audio_data.astype(np.float32))
+    if len(audio_tensor.shape) == 1:
+        audio_tensor = audio_tensor.unsqueeze(0)  # Add channel dimension
+
+    # Use torchaudio functional API for reliable resampling
+    # This ensures proper pitch preservation
+    try:
+        resampled = torchaudio.functional.resample(
+            audio_tensor,
+            orig_freq=int(orig_sr),
+            new_freq=int(target_sr),
+            lowpass_filter_width=64,
+            rolloff=0.9475937167399596,
+            resampling_method="sinc_interp_kaiser",
+            beta=14.769656459379492
+        )
+
+        # Convert back to numpy
+        result = resampled.squeeze(0).numpy()
+
+        # Verify the resampling produced the expected number of samples
+        expected_samples = int(len(audio_data) * target_sr / orig_sr)
+        if abs(len(result) - expected_samples) > 1:  # Allow 1 sample difference due to rounding
+            logger.warning(f"Resampling anomaly: expected ~{expected_samples} samples, got {len(result)}")
+
+        return result
+    except Exception as e:
+        logger.error(f"Error in fast_resample: {e}")
+        # Fallback to simple linear interpolation
+        logger.info("Falling back to simple resampling")
+        num_samples = int(len(audio_data) * target_sr / orig_sr)
+        return np.interp(
+            np.linspace(0, len(audio_data) - 1, num_samples),
+            np.arange(len(audio_data)),
+            audio_data
+        )
 
 
 # ============================================================================
@@ -61,7 +126,7 @@ class VoiceCloner:
         x_vector_only_mode=False,
         chunk_duration=3.0,
         max_utterance_duration=10.0,
-        silence_duration=0.8,
+        silence_duration=0.5,
     ):
         self.voice_sample_path = Path(voice_sample_path)
         self.voice_sample_text = voice_sample_text
@@ -79,7 +144,18 @@ class VoiceCloner:
 
         # Load voice sample
         voice_audio, voice_sr = sf.read(str(self.voice_sample_path))
-        logger.info(f"Voice sample loaded: {self.voice_sample_path}")
+        logger.info(f"Voice sample loaded: {self.voice_sample_path} ({voice_sr}Hz, {len(voice_audio)} samples, {len(voice_audio)/voice_sr:.2f}s)")
+
+        # Resample voice sample to 24kHz if needed (Qwen3-TTS expects 24kHz)
+        if voice_sr != 24000:
+            logger.info(f"Resampling voice sample from {voice_sr}Hz to 24000Hz for TTS model")
+            voice_audio = fast_resample(voice_audio, voice_sr, 24000)
+            voice_sr = 24000
+            # Save resampled version temporarily for TTS
+            resampled_path = self.voice_sample_path.parent / f"{self.voice_sample_path.stem}_24k.wav"
+            sf.write(str(resampled_path), voice_audio, voice_sr)
+            self.voice_sample_path = resampled_path
+            logger.info(f"Saved resampled voice sample to {resampled_path}")
 
         # Initialize Silero VAD for better voice activity detection
         if vad_filter:
@@ -126,7 +202,7 @@ class VoiceCloner:
         # Audio buffers
         self.input_queue = queue.Queue()
         self.output_queue = queue.Queue()
-        self.output_buffer = np.array([], dtype=np.float32)
+        self.output_buffer = deque(maxlen=self.sample_rate * 10)  # 10 second max buffer
 
         # Control flags
         self.running = False
@@ -161,12 +237,12 @@ class VoiceCloner:
                 sf.write(tmp_input.name, audio_chunk, self.sample_rate)
                 tmp_input_path = tmp_input.name
 
-            # Speech-to-Text with Whisper (improved settings)
+            # Speech-to-Text with Whisper (optimized for low latency)
             segments, info = self.whisper_model.transcribe(
                 tmp_input_path,
                 language="en",
-                beam_size=5,  # Better accuracy
-                best_of=5,  # Sample multiple times
+                beam_size=1,  # Faster inference
+                best_of=1,  # Single pass for speed
                 temperature=0.0,  # Deterministic output
                 vad_filter=False,  # We already did VAD with Silero
                 condition_on_previous_text=True,  # Use context
@@ -195,19 +271,32 @@ class VoiceCloner:
                 repetition_penalty=1.05,
             )
 
+            # Use forced sample rate if specified, otherwise use model's reported rate
+            actual_sr = self.forced_tts_samplerate if hasattr(self, 'forced_tts_samplerate') and self.forced_tts_samplerate else sr
+
             if self.output_sample_rate is None:
-                self.output_sample_rate = sr
-                logger.info(f"TTS output sample rate: {sr}Hz")
+                self.output_sample_rate = actual_sr
+                logger.info(f"TTS output sample rate: {actual_sr}Hz{' (forced)' if actual_sr != sr else ''}")
+                if actual_sr != sr:
+                    logger.warning(f"Overriding model's reported rate {sr}Hz with forced rate {actual_sr}Hz")
+            elif actual_sr != self.output_sample_rate:
+                logger.warning(f"TTS sample rate changed: {self.output_sample_rate}Hz -> {actual_sr}Hz")
+                self.output_sample_rate = actual_sr
 
             if wavs and len(wavs) > 0:
                 audio_data = wavs[0]
-                logger.info(f"Generated TTS audio: {len(audio_data)} samples at {sr}Hz")
+                duration_s = len(audio_data) / actual_sr
+                logger.info(f"Generated TTS audio: {len(audio_data)} samples at {actual_sr}Hz ({duration_s:.2f}s)")
+
+                # Normalize and apply soft clipping to prevent audio artifacts
+                audio_data = normalize_audio(audio_data)
+                audio_data = soft_clip(audio_data)
 
                 # Record if enabled
                 if self.recording_file:
                     self.recorded_audio.append((audio_data.copy(), sr))
 
-                result = (audio_data, sr)
+                result = (audio_data, actual_sr)
             else:
                 logger.warning("TTS returned no audio data (empty or None)")
                 result = None
@@ -240,7 +329,7 @@ class VoiceCloner:
 
     def processing_loop(self):
         """Main processing loop - uses utterance-based detection"""
-        audio_buffer = np.array([], dtype=np.float32)
+        audio_buffer = deque(maxlen=int(self.max_utterance_duration * self.sample_rate * 2))
         last_speech_end = None
         speech_started = False
 
@@ -255,7 +344,7 @@ class VoiceCloner:
                 # Get audio from input queue
                 try:
                     audio_chunk = self.input_queue.get(timeout=QUEUE_TIMEOUT)
-                    audio_buffer = np.append(audio_buffer, audio_chunk.flatten())
+                    audio_buffer.extend(audio_chunk.flatten())
                 except queue.Empty:
                     # Check if we have a pending utterance that timed out
                     if len(audio_buffer) > 0 and speech_started:
@@ -263,8 +352,10 @@ class VoiceCloner:
                             silence_samples_accumulated = len(audio_buffer) - last_speech_end
                             if silence_samples_accumulated >= silence_samples:
                                 # Process the utterance (speech ended)
-                                utterance = audio_buffer[:last_speech_end]
-                                audio_buffer = audio_buffer[last_speech_end:]
+                                audio_array = np.array(audio_buffer, dtype=np.float32)
+                                utterance = audio_array[:last_speech_end]
+                                audio_buffer.clear()
+                                audio_buffer.extend(audio_array[last_speech_end:])
                                 last_speech_end = None
                                 speech_started = False
 
@@ -279,7 +370,8 @@ class VoiceCloner:
                 # Check buffer periodically with VAD (every 0.5s of audio or when buffer is large)
                 if len(audio_buffer) >= vad_check_interval or len(audio_buffer) >= max_buffer_samples:
                     if self.vad_model is not None:
-                        audio_tensor = torch.FloatTensor(audio_buffer)
+                        audio_array = np.array(audio_buffer, dtype=np.float32)
+                        audio_tensor = torch.FloatTensor(audio_array)
 
                         speech_timestamps = get_speech_timestamps(
                             audio_tensor,
@@ -301,8 +393,11 @@ class VoiceCloner:
 
                             if silence_after >= silence_samples:
                                 # Complete utterance detected - process it
-                                utterance = audio_buffer[:last_speech_end]
-                                audio_buffer = audio_buffer[last_speech_end:]
+                                audio_array = np.array(audio_buffer, dtype=np.float32)
+                                utterance = audio_array[:last_speech_end]
+                                # Clear buffer and keep only audio after utterance
+                                audio_buffer.clear()
+                                audio_buffer.extend(audio_array[last_speech_end:])
                                 last_speech_end = None
                                 speech_started = False
 
@@ -315,13 +410,17 @@ class VoiceCloner:
                         else:
                             # No speech detected - clear old buffer if no speech started
                             if not speech_started and len(audio_buffer) > max_buffer_samples:
-                                audio_buffer = audio_buffer[-silence_samples:]  # Keep only recent silence
+                                audio_array = np.array(audio_buffer, dtype=np.float32)
+                                audio_buffer.clear()
+                                audio_buffer.extend(audio_array[-silence_samples:])  # Keep only recent silence
                     else:
                         # No VAD - fall back to fixed chunks
                         chunk_samples = int(self.chunk_duration * self.sample_rate)
                         if len(audio_buffer) >= chunk_samples:
-                            chunk = audio_buffer[:chunk_samples]
-                            audio_buffer = audio_buffer[chunk_samples:]
+                            audio_array = np.array(audio_buffer, dtype=np.float32)
+                            chunk = audio_array[:chunk_samples]
+                            audio_buffer.clear()
+                            audio_buffer.extend(audio_array[chunk_samples:])
 
                             result = self.process_audio_chunk(chunk)
                             if result:
@@ -332,10 +431,12 @@ class VoiceCloner:
 
                 # Prevent buffer from growing too large
                 if len(audio_buffer) > max_buffer_samples:
+                    audio_array = np.array(audio_buffer, dtype=np.float32)
                     if speech_started and last_speech_end is not None:
                         # Force process the current utterance
-                        utterance = audio_buffer[:last_speech_end]
-                        audio_buffer = audio_buffer[last_speech_end:]
+                        utterance = audio_array[:last_speech_end]
+                        audio_buffer.clear()
+                        audio_buffer.extend(audio_array[last_speech_end:])
                         last_speech_end = None
                         speech_started = False
 
@@ -347,7 +448,8 @@ class VoiceCloner:
                             self.output_queue.put((audio_data, sr))
                     else:
                         # No speech or can't determine end - just process what we have
-                        audio_buffer = audio_buffer[-silence_samples:]
+                        audio_buffer.clear()
+                        audio_buffer.extend(audio_array[-silence_samples:])
 
             except Exception as e:
                 logger.exception(f"Error in processing loop: {e}")
@@ -364,25 +466,34 @@ class VoiceCloner:
 
                 # Resample TTS output (usually 24000Hz) to output stream sample rate
                 if sr != self.output_stream_sample_rate:
-                    num_samples = int(len(audio_data) * self.output_stream_sample_rate / sr)
-                    audio_data = signal.resample(audio_data, num_samples)
+                    expected_samples = int(len(audio_data) * self.output_stream_sample_rate / sr)
+                    logger.info(f"Resampling TTS audio: {sr}Hz -> {self.output_stream_sample_rate}Hz ({len(audio_data)} -> {expected_samples} samples)")
+                    audio_data = fast_resample(audio_data, sr, self.output_stream_sample_rate)
+                    logger.info(f"Resampling complete: output has {len(audio_data)} samples")
 
                 # Ensure mono and flatten
                 if len(audio_data.shape) > 1:
                     audio_data = audio_data.mean(axis=1)
+                    # Normalize after mixing channels to prevent amplitude increase
+                    audio_data = normalize_audio(audio_data)
 
-                self.output_buffer = np.append(self.output_buffer, audio_data)
+                # Ensure no clipping with final soft clip
+                audio_data = np.clip(audio_data, -1.0, 1.0)
+
+                self.output_buffer.extend(audio_data)
 
             # Fill output from buffer
             if len(self.output_buffer) >= frames:
-                outdata[:] = self.output_buffer[:frames].reshape(-1, 1)
-                self.output_buffer = self.output_buffer[frames:]
+                # Convert deque to numpy array for the output
+                output_array = np.array([self.output_buffer.popleft() for _ in range(frames)], dtype=np.float32)
+                outdata[:] = output_array.reshape(-1, 1)
             else:
                 # Not enough buffered - output what we have and pad with zeros
-                if len(self.output_buffer) > 0:
-                    outdata[: len(self.output_buffer)] = self.output_buffer.reshape(-1, 1)
-                    outdata[len(self.output_buffer) :] = 0
-                    self.output_buffer = np.array([], dtype=np.float32)
+                available = len(self.output_buffer)
+                if available > 0:
+                    output_array = np.array([self.output_buffer.popleft() for _ in range(available)], dtype=np.float32)
+                    outdata[:available] = output_array.reshape(-1, 1)
+                    outdata[available:] = 0
                 else:
                     outdata.fill(0)
 
@@ -419,8 +530,9 @@ class VoiceCloner:
         logger.info("Starting audio streams...")
         logger.info(f"Input device: {input_device or 'default'}")
         logger.info(f"Output device: {output_device or 'default'}")
-        logger.info(f"Sample rate: {self.sample_rate}Hz")
+        logger.info(f"Input sample rate: {self.sample_rate}Hz")
         logger.info(f"Output stream sample rate: {self.output_stream_sample_rate}Hz")
+        logger.info(f"TTS output sample rate: {self.output_sample_rate or 'not yet determined'}Hz")
         logger.info(f"Chunk duration: {self.chunk_duration}s")
 
         # Use larger blocksize for more stable buffering
@@ -583,8 +695,8 @@ EXAMPLES:
     parser.add_argument(
         "--silence-duration",
         type=float,
-        default=0.8,
-        help="Silence duration to detect end of sentence in seconds (default: 0.8)",
+        default=0.5,
+        help="Silence duration to detect end of sentence in seconds (default: 0.5)",
     )
     parser.add_argument(
         "--x-vector-only",
@@ -595,8 +707,24 @@ EXAMPLES:
         "--record-output",
         help="Record all TTS output to a WAV file (e.g., output.wav)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging for troubleshooting",
+    )
+    parser.add_argument(
+        "--force-tts-samplerate",
+        type=int,
+        help="Force TTS output sample rate (e.g., 24000) if auto-detection is wrong",
+    )
 
     args = parser.parse_args()
+
+    # Set debug logging if requested
+    if hasattr(args, 'debug') and args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
+        logger.info("Debug logging enabled")
 
     if args.list_devices:
         list_audio_devices()
@@ -638,6 +766,11 @@ EXAMPLES:
         silence_duration=args.silence_duration,
     )
     cloner.recording_file = args.record_output
+
+    # Apply forced TTS sample rate if specified
+    if hasattr(args, 'force_tts_samplerate') and args.force_tts_samplerate:
+        cloner.forced_tts_samplerate = args.force_tts_samplerate
+        logger.info(f"Forcing TTS sample rate to {args.force_tts_samplerate}Hz")
 
     cloner.start(
         input_device=args.input_device, output_device=output_device, output_stream_sr=sink_sr
